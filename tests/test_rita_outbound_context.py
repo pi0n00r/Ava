@@ -197,6 +197,28 @@ def test_opening_format_controls_use_generic_without_changing_native_context(cha
     assert value["human_acknowledgement"] == "unproven"
 
 
+@pytest.mark.parametrize("codepoint", range(0x13439, 0x13440))
+def test_opening_unicode14_compatibility_preserves_native_context(codepoint):
+    char = chr(codepoint)
+    for field in ("opening_kind", "opening_text"):
+        fields = {"opening_kind": "notification", "opening_text": "Hi Avery, it's AIm\u00e8e."}
+        fields[field] += char
+        purpose = "native" + char + " purpose"
+        response = _response(**fields, purpose=purpose, pin_verified=True,
+            ext6_auth_pass_observed=True, ext6_auth_observation_available=True)
+        value = project_rita_context(response)
+        assert value[field] is None
+        assert value["opening_text"] is None
+        assert rita_outbound_greeting(value) == "Hi, it's AIm\u00e8e."
+        assert rita_outbound_greeting(dict(response, status="ready")) == "Hi, it's AIm\u00e8e."
+        assert value["status"] == "ready" and value["direction"] == "outbound"
+        assert value["purpose"] == purpose
+        assert value["pin_verified"] is True
+        assert value["ext6_auth_pass_observed"] is True
+        assert value["ext6_auth_observation_available"] is True
+        assert value["human_acknowledgement"] == "unproven"
+
+
 def test_opening_utf8_boundary_and_no_numeric_or_identity_rewrites():
     text = "\u00e9" * 512
     value = project_rita_context(_response(opening_kind="outgoing", opening_text=text))

@@ -35,8 +35,10 @@ def _opening_value(value, max_bytes, private_values):
         size = len(value.encode("utf-8"))
     except UnicodeError:
         return None
+    # Unicode 14 classifies these seven Unicode 15 format controls as unassigned.
     if (size > max_bytes
-            or any(unicodedata.category(char) in ("Cc", "Cf", "Zl", "Zp") for char in value)
+            or any(unicodedata.category(char) in ("Cc", "Cf", "Zl", "Zp")
+                   or 0x13439 <= ord(char) <= 0x1343F for char in value)
             or any(secret and secret in value for secret in private_values)):
         return None
     return value
