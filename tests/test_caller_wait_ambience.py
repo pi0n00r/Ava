@@ -2,6 +2,8 @@ import asyncio
 import hashlib
 import time
 import wave
+import random
+from itertools import islice
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -78,6 +80,147 @@ def test_managed_in_call_http_tool_requires_explicit_ambience_opt_in() -> None:
     )
     assert plain.caller_wait_ambience is False
     assert opted_in.caller_wait_ambience is True
+
+
+def test_default_wait_frames_are_byte_identical_to_retained_loop():
+    manager, _, _ = _manager()
+    asset = manager._load_caller_wait_ambience()
+    frames = list(islice(manager._caller_wait_ambience_frames(asset), 600))
+    assert b"".join(frames) == asset * 3
+
+
+def test_varied_wait_frames_have_bounded_smoothed_bursts_gain_and_rests():
+    manager, _, _ = _manager()
+    manager.attack_ms = 20
+    asset = (10000).to_bytes(2, "little", signed=True) * 32000
+    frames = list(islice(manager._caller_wait_ambience_frames(asset, varied=True, rng=random.Random(7)), 1200))
+    assert all(len(frame) == 320 for frame in frames)
+    runs = []
+    for frame in frames:
+        silent = not any(frame)
+        if runs and runs[-1][0] == silent:
+            runs[-1][1].append(frame)
+        else:
+            runs.append([silent, [frame]])
+    bursts = [run for silent, run in runs[:-1] if not silent]
+    rests = [run for silent, run in runs[:-1] if silent]
+    assert len(bursts) > 5
+    assert len({len(run) for run in bursts}) > 1
+    assert len({run[1] for run in bursts}) > 1
+    assert all(40 <= len(run) <= 110 for run in bursts)
+    assert all(15 <= len(run) <= 55 for run in rests)
+    for run in bursts:
+        assert run[0][:2] == b"\x00\x00"
+        assert run[-1][-2:] == b"\x00\x00"
+        assert 5500 <= int.from_bytes(run[1][:2], "little", signed=True) <= 9000
+
+
+def test_varied_wait_rng_and_cursor_are_call_local():
+    manager, _, _ = _manager()
+    asset = manager._load_caller_wait_ambience()
+    first = manager._caller_wait_ambience_frames(asset, varied=True, rng=random.Random(19))
+    interleaved = manager._caller_wait_ambience_frames(asset, varied=True, rng=random.Random(19))
+    other = manager._caller_wait_ambience_frames(asset, varied=True, rng=random.Random(3))
+    expected = [next(first) for _ in range(400)]
+    actual = []
+    for _ in range(400):
+        next(other)
+        actual.append(next(interleaved))
+    assert actual == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("context,varied", [("aimee_main", True), ("aimee", False), (None, False)])
+async def test_only_existing_main_model_wait_entry_selects_variation(context, varied):
+    manager, _, session = _manager()
+    session.context_name = context
+    engine = Engine.__new__(Engine)
+    engine.streaming_playback_manager = manager
+    engine.session_store = manager.session_store
+    native = manager.start_caller_wait_ambience
+    seen = []
+    async def start(call, **kwargs):
+        seen.append(kwargs)
+        return await native(call, **kwargs)
+    manager.start_caller_wait_ambience = start
+    owner = await engine._start_pipeline_model_wait("call", {"call_id_header_enabled": True, "session_user_from_call_id": True})
+    assert owner is not None
+    assert seen == ([{"varied": True}] if varied else [{}])
+    await engine._stop_pipeline_model_wait("call", owner)
+    assert owner.done()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("varied", [False, True])
+async def test_wait_frames_pause_for_real_tts_and_resume_without_duplicate_owner(varied):
+    manager, server, session = _manager()
+    assert await manager.start_caller_wait_ambience("call", varied=varied)
+    owner = manager._caller_wait_ambience_tasks["call"]
+    await asyncio.sleep(0.08)
+    manager.active_streams["call"] = {"stream_id": "real-tts"}
+    await asyncio.sleep(0.06)
+    count = len(server.frames)
+    await asyncio.sleep(0.06)
+    assert len(server.frames) == count
+    assert not await manager.start_caller_wait_ambience("call", varied=varied)
+    manager.active_streams.clear()
+    await asyncio.sleep(0.08)
+    assert len(server.frames) > count
+    assert manager._caller_wait_ambience_tasks == {"call": owner}
+    assert session.audio_capture_enabled
+    assert manager.conversation_coordinator.on_tts_start.await_count == 0
+    await manager.stop_caller_wait_ambience("call")
+    assert owner.done()
+
+
+@pytest.mark.asyncio
+async def test_varied_wait_stop_cancel_and_two_call_isolation():
+    manager, server, session = _manager()
+    second = SimpleNamespace(audiosocket_conn_id="other", audio_capture_enabled=True)
+    sessions = {"call": session, "other": second}
+    manager.session_store.get_by_call_id = AsyncMock(side_effect=sessions.get)
+    counts = {"conn": 0, "other": 0}
+    native_send = server.send_audio
+    async def send(connection, payload, **kwargs):
+        counts[connection] += 1
+        return await native_send(connection, payload, **kwargs)
+    server.send_audio = send
+    assert await manager.start_caller_wait_ambience("call", varied=True)
+    assert await manager.start_caller_wait_ambience("other", varied=True)
+    second_owner = manager._caller_wait_ambience_tasks["other"]
+    await asyncio.sleep(0.08)
+    await manager.stop_caller_wait_ambience("call")
+    stopped = counts["conn"]
+    continuing = counts["other"]
+    await asyncio.sleep(0.06)
+    assert counts["conn"] == stopped
+    assert counts["other"] > continuing
+    assert manager._caller_wait_ambience_tasks == {"other": second_owner}
+    second_owner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await manager.stop_caller_wait_ambience("other")
+    assert second_owner.done()
+    assert not manager._caller_wait_ambience_tasks
+    assert not manager._caller_wait_ambience_stops
+    assert session.audio_capture_enabled and second.audio_capture_enabled
+
+
+@pytest.mark.asyncio
+async def test_varied_wait_failed_transport_settles_without_retry_or_gate():
+    manager, server, session = _manager()
+    async def failed_send(*args, **kwargs):
+        return False
+    server.send_audio = failed_send
+    assert await manager.start_caller_wait_ambience("call", varied=True)
+    owner = manager._caller_wait_ambience_tasks["call"]
+    await asyncio.wait_for(asyncio.shield(owner), 1)
+    assert owner.done()
+    assert await manager.stop_caller_wait_ambience("call")
+    assert not manager._caller_wait_ambience_tasks
+    assert not manager._caller_wait_ambience_stops
+    assert not manager.active_streams
+    assert session.audio_capture_enabled
+    assert manager.conversation_coordinator.on_tts_start.await_count == 0
 
 
 @pytest.mark.asyncio

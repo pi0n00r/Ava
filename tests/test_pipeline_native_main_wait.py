@@ -65,6 +65,7 @@ async def _native_wait_pipeline(monkeypatch, tmp_path, *, scoped=True, establish
     call_id = str(uuid.uuid4())
     session = CallSession(call_id=call_id, caller_channel_id=call_id, audio_capture_enabled=True)
     session.pipeline_name = "native-main"
+    session.context_name = "aimee_main" if scoped else "aimee"
     if established_context:
         session.is_outbound = True
         session.rita_outbound_context = established_context
@@ -147,6 +148,8 @@ async def test_native_cold_wait_paces_real_audio_for_54_seconds_without_gating(m
         assert frames[-1][0] - frames[0][0] > 53.0
         assert all(len(payload) == 320 for _, payload in frames)
         assert any(any(payload) for _, payload in frames)
+        assert any(payload == b"\x00" * 320 for _, payload in frames)
+        assert len({payload for _, payload in frames}) > 200
         gaps = [right[0] - left[0] for left, right in zip(frames, frames[1:])]
         assert max(gaps) < 1.0
         h.llm.release.set()

@@ -7231,7 +7231,12 @@ class Engine:
                 or llm_options.get("session_user_from_call_id") is not True):
             return None
         manager = self.streaming_playback_manager
-        if not await manager.start_caller_wait_ambience(call_id):
+        session = await self.session_store.get_by_call_id(call_id)
+        if session and session.context_name == "aimee_main":
+            started = await manager.start_caller_wait_ambience(call_id, varied=True)
+        else:
+            started = await manager.start_caller_wait_ambience(call_id)
+        if not started:
             return None
         return manager._caller_wait_ambience_tasks.get(call_id)
 

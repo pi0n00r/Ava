@@ -18,6 +18,7 @@ import math
 import os
 import wave
 import hashlib
+import random
 
 from src.audio.resampler import (
     mulaw_to_pcm16le,
@@ -2726,10 +2727,42 @@ class StreamingPlaybackManager:
             raise ValueError("caller wait ambience asset is silent")
         return frames
 
+    def _caller_wait_ambience_frames(self, asset: bytes, *, varied: bool = False, rng=None):
+        """Keep legacy bytes exact; shape bounded excerpts for main model wait."""
+        frame_bytes = 320
+        offset = 0
+        if not varied:
+            while True:
+                end = offset + frame_bytes
+                if end <= len(asset):
+                    frame = asset[offset:end]
+                else:
+                    frame = asset[offset:] + asset[: end - len(asset)]
+                offset = end % len(asset)
+                yield frame
+
+        # Local to this call's existing task; no shared random cursor or schedule.
+        rng = rng if rng is not None else random.Random()
+        while True:
+            offset = rng.randrange(len(asset) // frame_bytes) * frame_bytes
+            burst_frames = rng.randint(40, 110)
+            excerpt = (asset[offset:] + asset[:offset])[:burst_frames * frame_bytes]
+            burst = audioop.mul(excerpt, 2, rng.uniform(0.55, 0.90))
+            burst = self._apply_attack_envelope("", burst, 8000, {})
+            burst = audioop.reverse(self._apply_attack_envelope(
+                "", audioop.reverse(burst, 2), 8000, {}
+            ), 2)
+            for start in range(0, len(burst), frame_bytes):
+                yield burst[start:start + frame_bytes]
+            for _ in range(rng.randint(15, 55)):
+                yield b"\x00" * frame_bytes
+
     async def _caller_wait_ambience_loop(
         self,
         call_id: str,
         stop_event: asyncio.Event,
+        *,
+        varied: bool = False,
     ) -> None:
         """Pace one non-gating typing loop onto the call-owned AudioSocket."""
         frame_ms = 20
@@ -2737,7 +2770,7 @@ class StreamingPlaybackManager:
         loop = asyncio.get_running_loop()
         try:
             asset = self._load_caller_wait_ambience()
-            offset = 0
+            frames = self._caller_wait_ambience_frames(asset, varied=varied)
             deadline = loop.time()
             while not stop_event.is_set():
                 # Agent TTS always wins.  Pausing here is defense-in-depth;
@@ -2750,12 +2783,7 @@ class StreamingPlaybackManager:
                     deadline = loop.time()
                     continue
 
-                end = offset + frame_bytes
-                if end <= len(asset):
-                    frame = asset[offset:end]
-                else:
-                    frame = asset[offset:] + asset[: end - len(asset)]
-                offset = end % len(asset)
+                frame = next(frames)
                 sent = await self._send_audio_chunk(
                     call_id,
                     "caller-wait-ambience",
@@ -2777,7 +2805,7 @@ class StreamingPlaybackManager:
         except Exception:
             logger.warning("Caller wait ambience stopped after an error", exc_info=True)
 
-    async def start_caller_wait_ambience(self, call_id: str) -> bool:
+    async def start_caller_wait_ambience(self, call_id: str, *, varied: bool = False) -> bool:
         """Start one caller-side typing loop without changing TTS/VAD state."""
         if self.audio_transport != "audiosocket" or not self.audiosocket_server:
             logger.warning("Caller wait ambience requires AudioSocket transport")
@@ -2791,7 +2819,7 @@ class StreamingPlaybackManager:
                 self._caller_wait_ambience_stops.pop(call_id, None)
             stop_event = asyncio.Event()
             task = asyncio.create_task(
-                self._caller_wait_ambience_loop(call_id, stop_event),
+                self._caller_wait_ambience_loop(call_id, stop_event, varied=varied),
                 name="caller-wait-ambience",
             )
             self._caller_wait_ambience_stops[call_id] = stop_event
