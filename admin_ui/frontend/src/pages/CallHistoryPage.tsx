@@ -1,0 +1,1408 @@
+import { useState, useEffect, useCallback, useRef } from 'react';
+import {
+    Phone, Filter, Download, Trash2,
+    ChevronLeft, ChevronRight, RefreshCw, X, MessageSquare,
+    Wrench, AlertCircle, CheckCircle, ArrowRightLeft, PhoneOff,
+    BarChart3, Users, Timer, Activity, TrendingUp, Zap, PieChart,
+    Play, Pause, Volume2, FileAudio, Search, ShieldCheck, SlidersHorizontal
+} from 'lucide-react';
+import axios from 'axios';
+import { toast } from 'sonner';
+import { FullscreenPanel } from '../components/ui/FullscreenPanel';
+import { useConfirmDialog } from '../hooks/useConfirmDialog';
+import { useLocation, useNavigate } from 'react-router-dom';
+import {
+    InCallToolGroup,
+    PhaseToolGroup,
+    type InCallToolCall,
+    type PhaseToolCall,
+} from '../components/calls/ToolExecutionGroups';
+
+interface CallRecordSummary {
+    id: string;
+    call_id: string;
+    caller_number: string | null;
+    caller_name: string | null;
+    called_number?: string | null;
+    start_time: string | null;
+    end_time: string | null;
+    duration_seconds: number;
+    provider_name: string;
+    pipeline_name: string | null;
+    context_name: string | null;
+    routing_method: string | null;  // 'ai_agent' | 'ai_context' | 'default' | null
+    voice?: string | null;          // Resolved session voice (v7.3.0; null = provider default)
+    voice_source?: string | null;   // 'override' | 'agent' | 'provider-default' | null
+    outcome: string;
+    error_message: string | null;
+    avg_turn_latency_ms: number;
+    total_turns: number;
+    barge_in_count: number;
+    external_platform?: string | null;
+    external_call_id?: string | null;
+    external_direction?: string | null;
+    external_disposition?: string | null;
+}
+
+interface CallRecordDetail extends CallRecordSummary {
+    pipeline_components: Record<string, string>;
+    conversation_history: Array<{ role: string; content: string; timestamp?: number | string }>;
+    transfer_destination: string | null;
+    tool_calls: InCallToolCall[];
+    pre_call_tool_calls: PhaseToolCall[];
+    post_call_tool_calls: PhaseToolCall[];
+    max_turn_latency_ms: number;
+    caller_audio_format: string;
+    codec_alignment_ok: boolean;
+    external_metadata?: {
+        mapping_id?: string | null;
+        mapping_name?: string | null;
+        finalized?: boolean;
+        requested_disposition?: string | null;
+        disposition_label?: string | null;
+        session?: Record<string, any>;
+        events?: Array<Record<string, any>>;
+    };
+}
+
+interface CallStats {
+    total_calls: number;
+    avg_duration_seconds: number;
+    max_duration_seconds: number;
+    total_duration_seconds: number;
+    avg_latency_ms: number;
+    total_turns: number;
+    total_barge_ins: number;
+    outcomes: Record<string, number>;
+    providers: Record<string, number>;
+    pipelines: Record<string, number>;
+    contexts: Record<string, number>;
+    calls_per_day: Array<{ date: string; count: number }>;
+    top_callers: Array<{ number: string; count: number }>;
+    calls_with_tools: number;
+    top_tools: Record<string, number>;
+    active_calls: number;
+}
+
+interface FilterOptions {
+    providers: string[];
+    pipelines: string[];
+    contexts: string[];
+    outcomes: string[];
+}
+
+interface ToolRedactionPolicy {
+    configured_mode: 'strict' | 'show_routing' | 'off';
+    configured_value_valid: boolean;
+    pending_restart: boolean | null;
+    modes: Record<string, string>;
+}
+
+const REDACTION_MODE_LABELS: Record<string, string> = {
+    strict: 'Strict',
+    show_routing: 'Show routing',
+    off: 'Off',
+};
+
+const formatDuration = (seconds: number): string => {
+    if (seconds < 60) return `${Math.round(seconds)}s`;
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.round(seconds % 60);
+    if (mins < 60) return `${mins}m ${secs}s`;
+    const hrs = Math.floor(mins / 60);
+    const remainMins = mins % 60;
+    return `${hrs}h ${remainMins}m`;
+};
+
+const formatDate = (dateStr: string | null): string => {
+    if (!dateStr) return '-';
+    const date = new Date(dateStr);
+    return date.toLocaleString();
+};
+
+const formatAudioTime = (seconds: number): string => {
+    if (!seconds || isNaN(seconds)) return '0:00';
+    const m = Math.floor(seconds / 60);
+    const s = Math.floor(seconds % 60);
+    return `${m}:${s.toString().padStart(2, '0')}`;
+};
+
+const formatFileSize = (bytes: number): string => {
+    if (bytes === 0) return '0 B';
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+};
+
+interface RecordingInfo {
+    has_recording: boolean;
+    filename: string | null;
+    file_path: string | null;
+    file_size_bytes: number;
+    duration_hint: string | null;
+}
+
+const OutcomeIcon = ({ outcome }: { outcome: string }) => {
+    switch (outcome) {
+        case 'completed':
+            return <CheckCircle className="w-4 h-4 text-green-500" />;
+        case 'transferred':
+            return <ArrowRightLeft className="w-4 h-4 text-blue-500" />;
+        case 'error':
+            return <AlertCircle className="w-4 h-4 text-red-500" />;
+        case 'abandoned':
+            return <PhoneOff className="w-4 h-4 text-yellow-500" />;
+        case 'no_input_timeout':
+            return <PhoneOff className="w-4 h-4 text-amber-500" />;
+        default:
+            return <Phone className="w-4 h-4 text-muted-foreground" />;
+    }
+};
+
+const outcomeLabel = (outcome: string): string => {
+    if (outcome === 'no_input_timeout') return 'No input timeout';
+    return outcome.replace(/_/g, ' ');
+};
+
+const CALL_DETAILS_FOCUSABLE_SELECTOR =
+    'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+// How a call was routed to its agent (engine writes call_records.routing_method).
+// Older calls predating the column have method === null and render nothing.
+const RoutingBadge = ({ method }: { method: string | null }) => {
+    if (!method) return null;
+    const meta: Record<string, { label: string; cls: string }> = {
+        ai_agent:   { label: 'Agent',   cls: 'bg-blue-500/15 text-blue-500' },
+        ai_context: { label: 'Context', cls: 'bg-purple-500/15 text-purple-500' },
+        default:    { label: 'Default', cls: 'bg-muted text-muted-foreground' },
+    };
+    const m = meta[method] ?? { label: method, cls: 'bg-muted text-muted-foreground' };
+    return (
+        <span className={`px-1.5 py-0.5 rounded text-xs font-medium ${m.cls}`}>{m.label}</span>
+    );
+};
+
+const CallHistoryPage = () => {
+    const { confirm } = useConfirmDialog();
+    const location = useLocation();
+    const navigate = useNavigate();
+    const [calls, setCalls] = useState<CallRecordSummary[]>([]);
+    const [stats, setStats] = useState<CallStats | null>(null);
+    const [filterOptions, setFilterOptions] = useState<FilterOptions | null>(null);
+    const [redactionPolicy, setRedactionPolicy] = useState<ToolRedactionPolicy | null>(null);
+    // slug -> display_name, so the call's context_name (== agent slug) shows the friendly name.
+    const [agentNames, setAgentNames] = useState<Record<string, string>>({});
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState<string | null>(null);
+    const [selectedCallSummary, setSelectedCallSummary] = useState<CallRecordSummary | null>(null);
+    const [selectedCall, setSelectedCall] = useState<CallRecordDetail | null>(null);
+    const [selectedCallLoading, setSelectedCallLoading] = useState(false);
+    const [showStats, setShowStats] = useState(true);
+    const callDetailsDialogRef = useRef<HTMLDivElement>(null);
+    const modalCall = selectedCall ?? selectedCallSummary;
+    const callDetailsOpen = Boolean(modalCall);
+
+    // Recording playback
+    const [recordingInfo, setRecordingInfo] = useState<RecordingInfo | null>(null);
+    const [recordingLoading, setRecordingLoading] = useState(false);
+    const audioRef = useRef<HTMLAudioElement | null>(null);
+    const audioBlobUrl = useRef<string | null>(null);
+    const [audioPlaying, setAudioPlaying] = useState(false);
+    const [audioCurrentTime, setAudioCurrentTime] = useState(0);
+    const [audioDuration, setAudioDuration] = useState(0);
+
+    // Pagination
+    const [page, setPage] = useState(1);
+    const [pageSize] = useState(20);
+    const [total, setTotal] = useState(0);
+    const [totalPages, setTotalPages] = useState(1);
+    
+    // Filters
+    const [filters, setFilters] = useState({
+        caller_number: '',
+        caller_name: '',
+        provider_name: '',
+        pipeline_name: '',
+        context_name: '',
+        outcome: '',
+        start_date: '',
+        end_date: '',
+    });
+    const [showFilters, setShowFilters] = useState(false);
+
+    // Transcript search with debounce
+    const [transcriptSearchInput, setTranscriptSearchInput] = useState('');
+    const [transcriptSearch, setTranscriptSearch] = useState('');
+    const transcriptSearchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+    const clearTranscriptSearch = useCallback(() => {
+        if (transcriptSearchTimer.current) {
+            clearTimeout(transcriptSearchTimer.current);
+            transcriptSearchTimer.current = null;
+        }
+        setTranscriptSearchInput('');
+        setTranscriptSearch('');
+        setPage(1);
+    }, []);
+
+    const handleTranscriptSearchChange = useCallback((value: string) => {
+        setTranscriptSearchInput(value);
+        if (transcriptSearchTimer.current) clearTimeout(transcriptSearchTimer.current);
+        if (value === '') {
+            transcriptSearchTimer.current = null;
+            setTranscriptSearch('');
+            setPage(1);
+            return;
+        }
+        transcriptSearchTimer.current = setTimeout(() => {
+            setTranscriptSearch(value);
+            setPage(1);
+        }, 300);
+    }, []);
+
+    useEffect(() => {
+        return () => {
+            if (transcriptSearchTimer.current) clearTimeout(transcriptSearchTimer.current);
+        };
+    }, []);
+
+    const fetchCalls = useCallback(async () => {
+        try {
+            setLoading(true);
+            setError(null);
+            
+            const params: Record<string, any> = {
+                page,
+                page_size: pageSize,
+            };
+            
+            // Add filters
+            Object.entries(filters).forEach(([key, value]) => {
+                if (value) params[key] = value;
+            });
+            if (transcriptSearch) params.transcript_search = transcriptSearch;
+
+            const res = await axios.get('/api/calls', { params });
+            setCalls(res.data.calls);
+            setTotal(res.data.total);
+            setTotalPages(res.data.total_pages);
+        } catch (err: any) {
+            console.error('Failed to fetch calls:', err);
+            setError(err?.response?.data?.detail || 'Failed to load call history');
+        } finally {
+            setLoading(false);
+        }
+    }, [page, pageSize, filters, transcriptSearch]);
+
+    const fetchStats = useCallback(async () => {
+        try {
+            const params: Record<string, any> = {};
+            if (filters.start_date) params.start_date = filters.start_date;
+            if (filters.end_date) params.end_date = filters.end_date;
+            
+            const res = await axios.get('/api/calls/stats', { params });
+            setStats(res.data);
+        } catch (err) {
+            console.error('Failed to fetch stats:', err);
+        }
+    }, [filters.start_date, filters.end_date]);
+
+    const fetchFilterOptions = useCallback(async () => {
+        try {
+            const res = await axios.get('/api/calls/filters');
+            setFilterOptions(res.data);
+        } catch (err) {
+            console.error('Failed to fetch filter options:', err);
+        }
+    }, []);
+
+    const fetchAgentNames = useCallback(async () => {
+        try {
+            const res = await axios.get('/api/agents');
+            const map: Record<string, string> = {};
+            for (const a of res.data || []) map[a.slug] = a.display_name;
+            setAgentNames(map);
+        } catch (err) {
+            // Non-fatal: rows fall back to the raw context slug if agents can't load.
+            console.error('Failed to fetch agent names:', err);
+        }
+    }, []);
+
+    const fetchRedactionPolicy = useCallback(async () => {
+        try {
+            const res = await axios.get('/api/calls/redaction-policy');
+            setRedactionPolicy(res.data);
+        } catch (err) {
+            // Best-effort for compatibility with older Admin API versions.
+            console.error('Failed to fetch Call History redaction policy:', err);
+        }
+    }, []);
+
+    useEffect(() => {
+        fetchCalls();
+    }, [fetchCalls]);
+
+    useEffect(() => {
+        fetchStats();
+    }, [fetchStats]);
+
+    useEffect(() => {
+        fetchFilterOptions();
+    }, [fetchFilterOptions]);
+
+    useEffect(() => {
+        fetchAgentNames();
+    }, [fetchAgentNames]);
+
+    useEffect(() => {
+        fetchRedactionPolicy();
+    }, [fetchRedactionPolicy]);
+
+    const cleanupAudio = useCallback(() => {
+        if (audioRef.current) {
+            audioRef.current.pause();
+            audioRef.current.src = '';
+            audioRef.current = null;
+        }
+        if (audioBlobUrl.current) {
+            URL.revokeObjectURL(audioBlobUrl.current);
+            audioBlobUrl.current = null;
+        }
+        setAudioPlaying(false);
+        setAudioCurrentTime(0);
+        setAudioDuration(0);
+    }, []);
+
+    // Cleanup audio on component unmount (e.g. navigating away while playing)
+    useEffect(() => {
+        return () => {
+            if (audioRef.current) {
+                audioRef.current.pause();
+                audioRef.current.src = '';
+                audioRef.current = null;
+            }
+            if (audioBlobUrl.current) {
+                URL.revokeObjectURL(audioBlobUrl.current);
+                audioBlobUrl.current = null;
+            }
+        };
+    }, []);
+
+    const fetchRecordingInfo = useCallback(async (recordId: string) => {
+        cleanupAudio();
+        setRecordingInfo(null);
+        setRecordingLoading(true);
+        try {
+            const res = await axios.get(`/api/calls/${recordId}/recording`);
+            setRecordingInfo(res.data);
+        } catch {
+            setRecordingInfo({ has_recording: false, filename: null, file_path: null, file_size_bytes: 0, duration_hint: null });
+        } finally {
+            setRecordingLoading(false);
+        }
+    }, [cleanupAudio]);
+
+    const closeCallDetails = useCallback(() => {
+        cleanupAudio();
+        setRecordingInfo(null);
+        setSelectedCall(null);
+        setSelectedCallSummary(null);
+
+        const params = new URLSearchParams(location.search);
+        if (params.has('id')) {
+            params.delete('id');
+            const search = params.toString();
+            navigate(
+                {
+                    pathname: location.pathname,
+                    search: search ? `?${search}` : '',
+                    hash: location.hash,
+                },
+                { replace: true }
+            );
+        }
+    }, [cleanupAudio, location.hash, location.pathname, location.search, navigate]);
+
+    useEffect(() => {
+        if (!callDetailsOpen) return;
+        const dialog = callDetailsDialogRef.current;
+        if (!dialog) return;
+
+        const previouslyFocused = document.activeElement as HTMLElement | null;
+        const previousBodyOverflow = document.body.style.overflow;
+
+        const isTopmostModal = () => {
+            const dialogs = Array.from(
+                document.querySelectorAll<HTMLElement>('[role="dialog"][aria-modal="true"]')
+            );
+            return dialogs[dialogs.length - 1] === dialog;
+        };
+
+        const handleKeyDown = (event: KeyboardEvent) => {
+            if (!isTopmostModal()) return;
+            if (event.key === 'Escape') {
+                event.preventDefault();
+                event.stopPropagation();
+                closeCallDetails();
+                return;
+            }
+            if (event.key !== 'Tab') return;
+
+            const focusable = Array.from(
+                dialog.querySelectorAll<HTMLElement>(CALL_DETAILS_FOCUSABLE_SELECTOR)
+            );
+            if (focusable.length === 0) {
+                event.preventDefault();
+                dialog.focus();
+                return;
+            }
+
+            const first = focusable[0];
+            const last = focusable[focusable.length - 1];
+            const active = document.activeElement;
+            if (event.shiftKey) {
+                if (active === first || active === dialog || !dialog.contains(active)) {
+                    event.preventDefault();
+                    last.focus();
+                }
+            } else if (active === last || active === dialog || !dialog.contains(active)) {
+                event.preventDefault();
+                first.focus();
+            }
+        };
+
+        document.addEventListener('keydown', handleKeyDown);
+        document.body.style.overflow = 'hidden';
+        dialog.focus();
+
+        return () => {
+            document.removeEventListener('keydown', handleKeyDown);
+            document.body.style.overflow = previousBodyOverflow;
+            previouslyFocused?.focus?.();
+        };
+    }, [callDetailsOpen, closeCallDetails]);
+
+    // Deep-link support: /history?id=<call_record_id>
+    useEffect(() => {
+        const id = new URLSearchParams(location.search).get('id');
+        if (!id) return;
+        if (selectedCall?.id === id || selectedCallSummary?.id === id) return;
+
+        setSelectedCallSummary(null);
+        setSelectedCall(null);
+        setSelectedCallLoading(true);
+        axios
+            .get(`/api/calls/${id}`)
+            .then(res => {
+                const detail: CallRecordDetail = res.data;
+                setSelectedCall(detail);
+                setSelectedCallSummary({
+                    id: detail.id,
+                    call_id: detail.call_id,
+                    caller_number: detail.caller_number,
+                    caller_name: detail.caller_name,
+                    start_time: detail.start_time,
+                    end_time: detail.end_time,
+                    duration_seconds: detail.duration_seconds,
+                    provider_name: detail.provider_name,
+                    pipeline_name: detail.pipeline_name,
+                    context_name: detail.context_name,
+                    routing_method: detail.routing_method,
+                    voice: detail.voice,
+                    voice_source: detail.voice_source,
+                    outcome: detail.outcome,
+                    error_message: detail.error_message,
+                    avg_turn_latency_ms: detail.avg_turn_latency_ms,
+                    total_turns: detail.total_turns,
+                    barge_in_count: detail.barge_in_count,
+                });
+                fetchRecordingInfo(id);
+            })
+            .catch(err => {
+                console.error('Failed to open deep-linked call record:', err);
+                setError(err?.response?.data?.detail || 'Failed to open call history record');
+            })
+            .finally(() => setSelectedCallLoading(false));
+    }, [location.search, selectedCall?.id, selectedCallSummary?.id, fetchRecordingInfo]);
+
+    const handleExport = async (format: 'csv' | 'json') => {
+        try {
+            const params: Record<string, any> = {};
+            Object.entries(filters).forEach(([key, value]) => {
+                if (value) params[key] = value;
+            });
+            
+            const res = await axios.get(`/api/calls/export/${format}`, { 
+                params,
+                responseType: 'blob'
+            });
+            
+            const url = window.URL.createObjectURL(res.data);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `call_history.${format}`;
+            a.click();
+            window.URL.revokeObjectURL(url);
+        } catch (err) {
+            console.error('Failed to export:', err);
+        }
+    };
+
+    const handleDelete = async (id: string) => {
+        const confirmed = await confirm({
+            title: 'Delete Call Record?',
+            description: 'Are you sure you want to delete this call record?',
+            confirmText: 'Delete',
+            variant: 'destructive'
+        });
+        if (!confirmed) return;
+        try {
+            await axios.delete(`/api/calls/${id}`);
+            fetchCalls();
+            fetchStats();
+            if (selectedCall?.id === id || selectedCallSummary?.id === id) {
+                closeCallDetails();
+            }
+        } catch (err) {
+            console.error('Failed to delete:', err);
+            toast.error('Failed to delete call record');
+        }
+    };
+
+    const openCallDetails = async (call: CallRecordSummary) => {
+        setSelectedCallSummary(call);
+        setSelectedCall(null);
+        setSelectedCallLoading(true);
+        try {
+            const res = await axios.get(`/api/calls/${call.id}`);
+            setSelectedCall(res.data);
+        } catch (err) {
+            console.error('Failed to fetch call details:', err);
+        } finally {
+            setSelectedCallLoading(false);
+        }
+        fetchRecordingInfo(call.id);
+    };
+
+    const handlePlayRecording = useCallback(async () => {
+        const recordId = selectedCall?.id || selectedCallSummary?.id;
+        if (!recordId) return;
+
+        // Toggle pause/resume on existing audio
+        if (audioRef.current && audioRef.current.src) {
+            if (audioPlaying) {
+                audioRef.current.pause();
+                setAudioPlaying(false);
+            } else {
+                try {
+                    await audioRef.current.play();
+                    setAudioPlaying(true);
+                } catch {
+                    setAudioPlaying(false);
+                    toast.error('Failed to resume playback');
+                }
+            }
+            return;
+        }
+
+        // Fresh play: fetch browser-playable recording audio as blob (auth header required)
+        try {
+            const res = await axios.get(`/api/calls/${recordId}/recording/audio`, { responseType: 'blob' });
+            const url = URL.createObjectURL(res.data);
+            audioBlobUrl.current = url;
+
+            const audio = new Audio(url);
+            audioRef.current = audio;
+            audio.onended = () => { setAudioPlaying(false); setAudioCurrentTime(0); };
+            audio.ontimeupdate = () => setAudioCurrentTime(audio.currentTime);
+            audio.onloadedmetadata = () => setAudioDuration(audio.duration);
+            await audio.play();
+            setAudioPlaying(true);
+        } catch (err: any) {
+            toast.error(err?.response?.data?.detail || 'Failed to play recording');
+        }
+    }, [selectedCall, selectedCallSummary, audioPlaying]);
+
+    const openTroubleshoot = (call: CallRecordSummary | CallRecordDetail) => {
+        const callId = call.call_id;
+        const start = (call as any).start_time;
+        const end = (call as any).end_time;
+        const params = new URLSearchParams();
+        params.set('container', 'ai_engine');
+        params.set('mode', 'troubleshoot');
+        params.set('preset', 'important');
+        params.set('call_id', callId);
+        if (start) params.set('since', start);
+        if (end) params.set('until', end);
+        window.location.href = `/logs?${params.toString()}`;
+    };
+
+    const clearFilters = () => {
+        clearTranscriptSearch();
+        setFilters({
+            caller_number: '',
+            caller_name: '',
+            provider_name: '',
+            pipeline_name: '',
+            context_name: '',
+            outcome: '',
+            start_date: '',
+            end_date: '',
+        });
+    };
+
+    const hasActiveFilters = Object.values(filters).some(v => v !== '') || transcriptSearch !== '';
+    return (
+        <div className="space-y-6">
+            {/* Header */}
+            <div className="flex items-center justify-between">
+                <h1 className="text-3xl font-bold">Call History</h1>
+                <div className="flex items-center gap-2">
+                    <div className="relative">
+                        <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+                        <input
+                            type="text"
+                            value={transcriptSearchInput}
+                            onChange={(e) => handleTranscriptSearchChange(e.target.value)}
+                            placeholder="Search transcripts..."
+                            aria-label="Search transcripts"
+                            className="pl-9 pr-8 py-2 bg-background border rounded-lg text-sm w-56 focus:outline-none focus:ring-1 focus:ring-ring"
+                        />
+                        {transcriptSearchInput && (
+                            <button
+                                onClick={clearTranscriptSearch}
+                                aria-label="Clear transcript search"
+                                title="Clear transcript search"
+                                className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                            >
+                                <X className="w-4 h-4" />
+                            </button>
+                        )}
+                    </div>
+                    <button
+                        onClick={() => setShowStats(!showStats)}
+                        className={`p-2 rounded-lg border transition-colors ${showStats ? 'bg-primary text-primary-foreground' : 'hover:bg-muted'}`}
+                        title="Toggle Stats"
+                    >
+                        <BarChart3 className="w-5 h-5" />
+                    </button>
+                    <button
+                        onClick={() => { fetchCalls(); fetchStats(); }}
+                        className="p-2 rounded-lg border hover:bg-muted"
+                        title="Refresh"
+                    >
+                        <RefreshCw className="w-5 h-5" />
+                    </button>
+                    <div className="relative">
+                        <button
+                            onClick={() => setShowFilters(!showFilters)}
+                            className={`p-2 rounded-lg border transition-colors ${showFilters || hasActiveFilters ? 'bg-primary text-primary-foreground' : 'hover:bg-muted'}`}
+                            title="Filters"
+                        >
+                            <Filter className="w-5 h-5" />
+                        </button>
+                        {hasActiveFilters && (
+                            <span className="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full" />
+                        )}
+                    </div>
+                    <div className="border-l h-6 mx-2" />
+                    <button
+                        onClick={() => handleExport('csv')}
+                        className="flex items-center gap-2 px-3 py-2 rounded-lg border hover:bg-muted text-sm"
+                    >
+                        <Download className="w-4 h-4" />
+                        CSV
+                    </button>
+                    <button
+                        onClick={() => handleExport('json')}
+                        className="flex items-center gap-2 px-3 py-2 rounded-lg border hover:bg-muted text-sm"
+                    >
+                        <Download className="w-4 h-4" />
+                        JSON
+                    </button>
+                </div>
+            </div>
+
+            {redactionPolicy && (
+                <div className="flex flex-col gap-3 rounded-lg border bg-muted/20 p-4 sm:flex-row sm:items-center sm:justify-between">
+                    <div className="flex gap-3">
+                        <ShieldCheck className="mt-0.5 h-5 w-5 shrink-0 text-blue-500" />
+                        <div>
+                            <div className="flex flex-wrap items-center gap-2 text-sm font-medium">
+                                <span>Tool history privacy: {REDACTION_MODE_LABELS[redactionPolicy.configured_mode] || redactionPolicy.configured_mode}</span>
+                                {redactionPolicy.pending_restart === true && (
+                                    <span className="rounded bg-amber-500/15 px-2 py-0.5 text-xs text-amber-600 dark:text-amber-400">
+                                        AI Engine restart pending
+                                    </span>
+                                )}
+                                {!redactionPolicy.configured_value_valid && (
+                                    <span className="rounded bg-red-500/15 px-2 py-0.5 text-xs text-red-600 dark:text-red-400">
+                                        Invalid setting; strict fallback
+                                    </span>
+                                )}
+                            </div>
+                            <p className="mt-1 text-xs text-muted-foreground">
+                                {redactionPolicy.modes[redactionPolicy.configured_mode]}
+                                {' '}Changes affect future tool executions only; historical redactions cannot be reversed.
+                            </p>
+                        </div>
+                    </div>
+                    <button
+                        type="button"
+                        onClick={() => navigate('/env?section=call-history#system')}
+                        className="inline-flex shrink-0 items-center justify-center gap-2 rounded-md border px-3 py-2 text-sm hover:bg-muted"
+                    >
+                        <SlidersHorizontal className="h-4 w-4" />
+                        Configure redaction
+                    </button>
+                </div>
+            )}
+
+            {/* Quick Troubleshoot */}
+            {modalCall && (
+                <div className="flex items-center gap-2">
+                    <button
+                        onClick={() => openTroubleshoot(modalCall)}
+                        className="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 border border-input bg-background shadow-sm hover:bg-accent hover:text-accent-foreground h-9 px-3"
+                        title="Open Logs filtered to this call"
+                    >
+                        Troubleshoot
+                    </button>
+                </div>
+            )}
+
+            {/* Stats Dashboard */}
+            {showStats && stats && (
+                <FullscreenPanel title="Call Statistics">
+                    <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
+                        <div className="bg-card border rounded-lg p-4">
+                            <div className="flex items-center gap-2 text-muted-foreground text-sm">
+                                <Phone className="w-4 h-4" />
+                                Total Calls
+                            </div>
+                            <div className="text-2xl font-bold mt-1">{stats.total_calls}</div>
+                        </div>
+                        <div className="bg-card border rounded-lg p-4">
+                            <div className="flex items-center gap-2 text-muted-foreground text-sm">
+                                <PieChart className="w-4 h-4" />
+                                Success / Failed
+                            </div>
+                            <div className="text-2xl font-bold mt-1">
+                                {stats.outcomes?.completed || 0} / {stats.outcomes?.error || 0}
+                            </div>
+                            <div className="text-xs text-muted-foreground">
+                                {stats.total_calls > 0
+                                    ? Math.round(((stats.outcomes?.completed || 0) / stats.total_calls) * 100)
+                                    : 0}% success rate
+                            </div>
+                        </div>
+                        <div className="bg-card border rounded-lg p-4">
+                            <div className="flex items-center gap-2 text-muted-foreground text-sm">
+                                <Activity className="w-4 h-4" />
+                                Active Calls
+                            </div>
+                            <div className="text-2xl font-bold mt-1">{stats.active_calls || 0}</div>
+                        </div>
+                        <div className="bg-card border rounded-lg p-4">
+                            <div className="flex items-center gap-2 text-muted-foreground text-sm">
+                                <Timer className="w-4 h-4" />
+                                Avg Duration
+                            </div>
+                            <div className="text-2xl font-bold mt-1">{formatDuration(stats.avg_duration_seconds)}</div>
+                        </div>
+                        <div className="bg-card border rounded-lg p-4">
+                            <div className="flex items-center gap-2 text-muted-foreground text-sm">
+                                <TrendingUp className="w-4 h-4" />
+                                Top Provider
+                            </div>
+                            <div className="text-lg font-bold mt-1 truncate">
+                                {Object.entries(stats.providers || {}).sort((a, b) => b[1] - a[1])[0]?.[0] || '-'}
+                            </div>
+                        </div>
+                        <div className="bg-card border rounded-lg p-4">
+                            <div className="flex items-center gap-2 text-muted-foreground text-sm">
+                                <Wrench className="w-4 h-4" />
+                                Top Tool
+                            </div>
+                            <div className="text-lg font-bold mt-1 truncate">
+                                {Object.entries(stats.top_tools || {}).sort((a, b) => b[1] - a[1])[0]?.[0] || '-'}
+                            </div>
+                            <div className="text-xs text-muted-foreground">{stats.calls_with_tools} calls used tools</div>
+                        </div>
+                    </div>
+                </FullscreenPanel>
+            )}
+
+            {/* Filters Panel */}
+            {showFilters && (
+                <div className="bg-card border rounded-lg p-4">
+                    <div className="flex items-center justify-between mb-4">
+                        <h3 className="font-semibold">Filters</h3>
+                        {hasActiveFilters && (
+                            <button onClick={clearFilters} className="text-sm text-primary hover:underline">
+                                Clear all
+                            </button>
+                        )}
+                    </div>
+                    <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-4">
+                        <div>
+                            <label className="text-sm text-muted-foreground">Caller Number</label>
+                            <input
+                                type="text"
+                                value={filters.caller_number}
+                                onChange={(e) => setFilters({ ...filters, caller_number: e.target.value })}
+                                placeholder="Phone number"
+                                className="w-full mt-1 px-3 py-2 bg-background border rounded-lg text-sm"
+                            />
+                        </div>
+                        <div>
+                            <label className="text-sm text-muted-foreground">Caller Name</label>
+                            <input
+                                type="text"
+                                value={filters.caller_name}
+                                onChange={(e) => setFilters({ ...filters, caller_name: e.target.value })}
+                                placeholder="Name"
+                                className="w-full mt-1 px-3 py-2 bg-background border rounded-lg text-sm"
+                            />
+                        </div>
+                        <div>
+                            <label className="text-sm text-muted-foreground">Provider</label>
+                            <select
+                                value={filters.provider_name}
+                                onChange={(e) => setFilters({ ...filters, provider_name: e.target.value })}
+                                className="w-full mt-1 px-3 py-2 bg-background border rounded-lg text-sm"
+                            >
+                                <option value="">All</option>
+                                {filterOptions?.providers.map(p => (
+                                    <option key={p} value={p}>{p}</option>
+                                ))}
+                            </select>
+                        </div>
+                        <div>
+                            <label className="text-sm text-muted-foreground">Pipeline</label>
+                            <select
+                                value={filters.pipeline_name}
+                                onChange={(e) => setFilters({ ...filters, pipeline_name: e.target.value })}
+                                className="w-full mt-1 px-3 py-2 bg-background border rounded-lg text-sm"
+                            >
+                                <option value="">All</option>
+                                {filterOptions?.pipelines.map(p => (
+                                    <option key={p} value={p}>{p}</option>
+                                ))}
+                            </select>
+                        </div>
+                        <div>
+                            <label className="text-sm text-muted-foreground">Agent</label>
+                            <select
+                                value={filters.context_name}
+                                onChange={(e) => setFilters({ ...filters, context_name: e.target.value })}
+                                className="w-full mt-1 px-3 py-2 bg-background border rounded-lg text-sm"
+                            >
+                                <option value="">All</option>
+                                {filterOptions?.contexts.map(c => (
+                                    <option key={c} value={c}>{agentNames[c] || c}</option>
+                                ))}
+                            </select>
+                        </div>
+                        <div>
+                            <label className="text-sm text-muted-foreground">Outcome</label>
+                            <select
+                                value={filters.outcome}
+                                onChange={(e) => setFilters({ ...filters, outcome: e.target.value })}
+                                className="w-full mt-1 px-3 py-2 bg-background border rounded-lg text-sm"
+                            >
+                                <option value="">All</option>
+                                {filterOptions?.outcomes.map(o => (
+                                    <option key={o} value={o}>{outcomeLabel(o)}</option>
+                                ))}
+                            </select>
+                        </div>
+                        <div>
+                            <label className="text-sm text-muted-foreground">From Date</label>
+                            <input
+                                type="date"
+                                value={filters.start_date}
+                                onChange={(e) => setFilters({ ...filters, start_date: e.target.value })}
+                                className="w-full mt-1 px-3 py-2 bg-background border rounded-lg text-sm"
+                            />
+                        </div>
+                        <div>
+                            <label className="text-sm text-muted-foreground">To Date</label>
+                            <input
+                                type="date"
+                                value={filters.end_date}
+                                onChange={(e) => setFilters({ ...filters, end_date: e.target.value })}
+                                className="w-full mt-1 px-3 py-2 bg-background border rounded-lg text-sm"
+                            />
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* Error State */}
+            {error && (
+                <div className="bg-destructive/10 border border-destructive/20 rounded-lg p-4 text-destructive">
+                    {error}
+                </div>
+            )}
+
+            {/* Loading State */}
+            {loading && (
+                <div className="flex items-center justify-center py-12">
+                    <RefreshCw className="w-8 h-8 animate-spin text-muted-foreground" />
+                </div>
+            )}
+
+            {/* Empty State */}
+            {!loading && !error && calls.length === 0 && (
+                <div className="bg-card border rounded-lg p-12 text-center">
+                    <div className="mx-auto w-16 h-16 bg-muted rounded-full flex items-center justify-center mb-4">
+                        <Phone className="w-8 h-8 text-muted-foreground" />
+                    </div>
+                    <h2 className="text-xl font-semibold mb-2">No Calls Found</h2>
+                    <p className="text-muted-foreground">
+                        {hasActiveFilters 
+                            ? 'No calls match your filters. Try adjusting your search criteria.'
+                            : 'Call history will appear here once calls are made.'}
+                    </p>
+                </div>
+            )}
+
+            {/* Call List */}
+            {!loading && !error && calls.length > 0 && (
+                <FullscreenPanel title="Call History">
+                    <div className="bg-card border rounded-lg overflow-x-auto">
+                        <table className="w-full min-w-[1000px]">
+                            <thead className="bg-muted/50">
+                                <tr>
+                                    <th className="text-left px-4 py-3 text-sm font-medium">Caller</th>
+                                    <th className="text-left px-4 py-3 text-sm font-medium">Time</th>
+                                    <th className="text-left px-4 py-3 text-sm font-medium">Duration</th>
+                                    <th className="text-left px-4 py-3 text-sm font-medium">Provider / Pipeline</th>
+                                    <th className="text-left px-4 py-3 text-sm font-medium">Agent</th>
+                                    <th className="text-left px-4 py-3 text-sm font-medium">Outcome</th>
+                                    <th className="text-left px-4 py-3 text-sm font-medium">Turns</th>
+                                    <th className="text-left px-4 py-3 text-sm font-medium">Latency</th>
+                                    <th className="text-left px-4 py-3 text-sm font-medium">Barge-ins</th>
+                                    <th className="text-center px-4 py-3 text-sm font-medium w-20">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody className="divide-y divide-border">
+                                {calls.map((call) => (
+	                                    <tr
+	                                        key={call.id} 
+	                                        className="hover:bg-muted/30 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+	                                        tabIndex={0}
+	                                        aria-label={`Open call details for ${call.caller_number || call.call_id}`}
+	                                        onClick={(event) => {
+	                                            event.currentTarget.focus();
+	                                            void openCallDetails(call);
+	                                        }}
+	                                        onKeyDown={(event) => {
+	                                            if (event.key !== 'Enter' && event.key !== ' ') return;
+	                                            event.preventDefault();
+	                                            void openCallDetails(call);
+	                                        }}
+	                                    >
+                                        <td className="px-4 py-3">
+                                            <div className="font-medium">{call.caller_number || 'Unknown'}</div>
+                                            {call.caller_name && (
+                                                <div className="text-sm text-muted-foreground">{call.caller_name}</div>
+                                            )}
+                                        </td>
+                                        <td className="px-4 py-3 text-sm">{formatDate(call.start_time)}</td>
+                                        <td className="px-4 py-3 text-sm">{formatDuration(call.duration_seconds)}</td>
+                                        <td className="px-4 py-3 text-sm">{call.pipeline_name || call.provider_name}</td>
+                                        <td className="px-4 py-3">
+                                            {call.context_name ? (
+                                                <div className="flex flex-col gap-1">
+                                                    <span className="text-sm font-medium">
+                                                        {agentNames[call.context_name] || call.context_name}
+                                                    </span>
+                                                    <div className="flex items-center gap-2">
+                                                        {agentNames[call.context_name] && (
+                                                            <span className="text-xs text-muted-foreground">{call.context_name}</span>
+                                                        )}
+                                                        <RoutingBadge method={call.routing_method} />
+                                                    </div>
+                                                </div>
+                                            ) : (
+                                                <span className="text-sm">-</span>
+                                            )}
+                                        </td>
+                                        <td className="px-4 py-3">
+                                            <div className="flex items-center gap-2">
+                                                <OutcomeIcon outcome={call.outcome} />
+                                                <span className="text-sm capitalize">{outcomeLabel(call.outcome)}</span>
+                                            </div>
+                                        </td>
+                                        <td className="px-4 py-3 text-sm">{call.total_turns}</td>
+                                        <td className="px-4 py-3 text-sm">{(call.avg_turn_latency_ms / 1000).toFixed(1)}s</td>
+                                        <td className="px-4 py-3 text-sm">{call.barge_in_count}</td>
+                                        <td className="px-4 py-3 text-center w-20">
+                                            <button
+                                                onClick={(e) => { e.stopPropagation(); handleDelete(call.id); }}
+                                                className="p-2 hover:bg-destructive/10 rounded text-destructive"
+                                                title="Delete"
+                                            >
+                                                <Trash2 className="w-4 h-4" />
+                                            </button>
+                                        </td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+
+                    {/* Pagination */}
+                    <div className="flex items-center justify-between">
+                        <div className="text-sm text-muted-foreground">
+                            Showing {((page - 1) * pageSize) + 1} to {Math.min(page * pageSize, total)} of {total} calls
+                        </div>
+                        <div className="flex items-center gap-2">
+                            <button
+                                onClick={() => setPage(p => Math.max(1, p - 1))}
+                                disabled={page === 1}
+                                className="p-2 rounded-lg border hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                                <ChevronLeft className="w-5 h-5" />
+                            </button>
+                            <span className="text-sm">
+                                Page {page} of {totalPages}
+                            </span>
+                            <button
+                                onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+                                disabled={page === totalPages}
+                                className="p-2 rounded-lg border hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                                <ChevronRight className="w-5 h-5" />
+                            </button>
+                        </div>
+                    </div>
+                </FullscreenPanel>
+            )}
+
+            {/* Call Detail Modal */}
+            {modalCall && (
+                <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+                    <div
+                        ref={callDetailsDialogRef}
+                        tabIndex={-1}
+                        role="dialog"
+                        aria-modal="true"
+                        aria-labelledby="call-details-title"
+                        className="bg-card border rounded-lg w-full max-w-4xl max-h-[90vh] overflow-hidden flex flex-col focus:outline-none"
+                    >
+                        {/* Modal Header */}
+                        <div className="flex items-center justify-between p-4 border-b">
+                            <div>
+                                <h2 id="call-details-title" className="text-xl font-bold">Call Details</h2>
+                                <p className="text-sm text-muted-foreground">{modalCall.call_id}</p>
+                            </div>
+                            <div className="flex items-center gap-2">
+                                <button
+                                    onClick={() => openTroubleshoot(modalCall)}
+                                    className="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 border border-input bg-background shadow-sm hover:bg-accent hover:text-accent-foreground h-9 px-3"
+                                    title="Open Logs filtered to this call"
+                                >
+                                    Troubleshoot
+                                </button>
+                                <button
+                                    onClick={() => handleDelete(modalCall.id)}
+                                    className="p-2 hover:bg-destructive/10 rounded-lg text-destructive"
+                                    title="Delete this call"
+                                >
+                                    <Trash2 className="w-5 h-5" />
+                                </button>
+                                <button
+                                    onClick={closeCallDetails}
+                                    className="p-2 hover:bg-muted rounded-lg"
+                                    aria-label="Close call details"
+                                    title="Close call details"
+                                >
+                                    <X className="w-5 h-5" />
+                                </button>
+                            </div>
+                        </div>
+
+                        {/* Call Recording Player */}
+                        <div className="px-4 py-3 border-b bg-muted/20">
+                            {recordingLoading ? (
+                                <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                                    Checking for recording…
+                                </div>
+                            ) : recordingInfo?.has_recording && recordingInfo.duration_hint !== 'empty' ? (
+                                <div className="flex items-center gap-3">
+                                    <button
+                                        onClick={handlePlayRecording}
+                                        className="flex items-center justify-center w-9 h-9 rounded-full bg-primary text-primary-foreground hover:bg-primary/90 transition-colors shrink-0"
+                                        title={audioPlaying ? 'Pause' : 'Play recording'}
+                                    >
+                                        {audioPlaying ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4 ml-0.5" />}
+                                    </button>
+                                    <div className="flex-1 min-w-0">
+                                        <div className="flex items-center gap-2">
+                                            <div className="flex-1 h-1.5 bg-muted rounded-full overflow-hidden cursor-pointer"
+                                                onClick={(e) => {
+                                                    if (!audioRef.current || !audioDuration) return;
+                                                    const rect = e.currentTarget.getBoundingClientRect();
+                                                    const pct = (e.clientX - rect.left) / rect.width;
+                                                    audioRef.current.currentTime = pct * audioDuration;
+                                                }}
+                                            >
+                                                <div
+                                                    className="h-full bg-primary rounded-full transition-all"
+                                                    style={{ width: `${audioDuration > 0 ? (audioCurrentTime / audioDuration) * 100 : 0}%` }}
+                                                />
+                                            </div>
+                                            <span className="text-xs text-muted-foreground whitespace-nowrap">
+                                                {formatAudioTime(audioCurrentTime)} / {formatAudioTime(audioDuration)}
+                                            </span>
+                                        </div>
+                                        <div className="flex items-center gap-1 mt-1">
+                                            <FileAudio className="w-3 h-3 text-muted-foreground shrink-0" />
+                                            <span className="text-xs text-muted-foreground truncate" title={recordingInfo.file_path || ''}>
+                                                {recordingInfo.filename}
+                                            </span>
+                                            <span className="text-xs text-muted-foreground whitespace-nowrap">
+                                                ({formatFileSize(recordingInfo.file_size_bytes)})
+                                            </span>
+                                        </div>
+                                    </div>
+                                </div>
+                            ) : recordingInfo?.duration_hint === 'empty' ? (
+                                <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                                    <Volume2 className="w-4 h-4" />
+                                    Recording exists but contains no audio
+                                </div>
+                            ) : (
+                                <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                                    <Volume2 className="w-4 h-4" />
+                                    No recording available
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Modal Content */}
+                        <div className="flex-1 overflow-y-auto p-4 space-y-6">
+                            {selectedCallLoading && (
+                                <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                                    <RefreshCw className="w-4 h-4 animate-spin" />
+                                    Loading full call details…
+                                </div>
+                            )}
+                            {/* Overview */}
+                            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
+                                <div>
+                                    <div className="text-sm text-muted-foreground">Caller</div>
+                                    <div className="font-medium">{modalCall.caller_number || 'Unknown'}</div>
+                                    {modalCall.caller_name && (
+                                        <div className="text-sm">{modalCall.caller_name}</div>
+                                    )}
+                                </div>
+                                <div>
+                                    <div className="text-sm text-muted-foreground">Duration</div>
+                                    <div className="font-medium">{formatDuration(modalCall.duration_seconds)}</div>
+                                </div>
+                                <div>
+                                    <div className="text-sm text-muted-foreground">Outcome</div>
+                                    <div className="flex items-center gap-2">
+                                        <OutcomeIcon outcome={modalCall.outcome} />
+                                        <span className="font-medium capitalize">{outcomeLabel(modalCall.outcome)}</span>
+                                    </div>
+                                </div>
+                                <div>
+                                    <div className="text-sm text-muted-foreground">Turns</div>
+                                    <div className="font-medium">{modalCall.total_turns}</div>
+                                </div>
+                                <div>
+                                    <div className="text-sm text-muted-foreground">Avg Latency</div>
+                                    <div className="font-medium">{(modalCall.avg_turn_latency_ms / 1000).toFixed(2)}s</div>
+                                </div>
+                                {selectedCall?.max_turn_latency_ms != null && (
+                                    <div>
+                                        <div className="text-sm text-muted-foreground">Max Latency</div>
+                                        <div className="font-medium">{(selectedCall.max_turn_latency_ms / 1000).toFixed(2)}s</div>
+                                    </div>
+                                )}
+                                <div>
+                                    <div className="text-sm text-muted-foreground">Barge-ins</div>
+                                    <div className="font-medium">{modalCall.barge_in_count}</div>
+                                </div>
+                            </div>
+
+                            {/* Configuration */}
+                            <div>
+                                <h3 className="font-semibold mb-2">Configuration</h3>
+                                <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+                                    <div>
+                                        <span className="text-muted-foreground">Provider:</span>{' '}
+                                        <span className="font-medium">{modalCall.provider_name}</span>
+                                    </div>
+                                    <div>
+                                        <span className="text-muted-foreground">Pipeline:</span>{' '}
+                                        <span className="font-medium">{modalCall.pipeline_name || '-'}</span>
+                                    </div>
+                                    <div>
+                                        <span className="text-muted-foreground">Agent:</span>{' '}
+                                        <span className="font-medium">
+                                            {modalCall.context_name
+                                                ? (agentNames[modalCall.context_name] || modalCall.context_name)
+                                                : '-'}
+                                        </span>
+                                        {modalCall.context_name && agentNames[modalCall.context_name] && (
+                                            <span className="text-xs text-muted-foreground"> ({modalCall.context_name})</span>
+                                        )}
+                                        {modalCall.routing_method && (
+                                            <span className="ml-2"><RoutingBadge method={modalCall.routing_method} /></span>
+                                        )}
+                                    </div>
+                                    {(modalCall.voice || modalCall.voice_source) && (
+                                        <div>
+                                            <span className="text-muted-foreground">Voice:</span>{' '}
+                                            <span className="font-medium">{modalCall.voice || 'provider default'}</span>
+                                            {modalCall.voice_source && (
+                                                <span className="text-xs text-muted-foreground">
+                                                    {' '}({modalCall.voice_source === 'provider-default' ? 'provider default' : `from ${modalCall.voice_source}`})
+                                                </span>
+                                            )}
+                                        </div>
+                                    )}
+                                    <div>
+                                        <span className="text-muted-foreground">Audio:</span>{' '}
+                                        <span className="font-medium">{selectedCall?.caller_audio_format || '-'}</span>
+                                    </div>
+                                </div>
+                            </div>
+
+                            {selectedCall?.external_platform && (
+                                <div>
+                                    <h3 className="font-semibold mb-2">External dialer</h3>
+                                    <div className="rounded-lg border border-border bg-card p-4">
+                                        <div className="grid gap-3 text-sm md:grid-cols-3 lg:grid-cols-6">
+                                            <div><div className="text-xs text-muted-foreground">Platform</div><div className="font-medium uppercase">{selectedCall.external_platform}</div></div>
+                                            <div><div className="text-xs text-muted-foreground">Call ID</div><div className="break-all font-mono text-xs">{selectedCall.external_call_id || '-'}</div></div>
+                                            <div><div className="text-xs text-muted-foreground">Direction</div><div className="font-medium capitalize">{selectedCall.external_direction || '-'}</div></div>
+                                            <div><div className="text-xs text-muted-foreground">Remote Agent</div><div className="font-mono">{selectedCall.external_metadata?.session?.agent_user || '-'}</div></div>
+                                            <div><div className="text-xs text-muted-foreground">Mapping</div><div className="font-medium">{selectedCall.external_metadata?.mapping_name || selectedCall.external_metadata?.mapping_id || '-'}</div></div>
+                                            <div><div className="text-xs text-muted-foreground">Disposition</div><div className="font-mono">{selectedCall.external_disposition || selectedCall.external_metadata?.requested_disposition || '-'}</div>{!selectedCall.external_disposition && selectedCall.external_metadata?.requested_disposition && <div className="text-[11px] text-amber-500">requested, not confirmed</div>}</div>
+                                        </div>
+                                        <div className="mt-3 text-xs text-muted-foreground">
+                                            Dialer lifecycle: {selectedCall.external_metadata?.finalized ? 'finalized' : 'not confirmed'} · API events: {selectedCall.external_metadata?.events?.length || 0}
+                                        </div>
+                                        {(selectedCall.external_metadata?.events?.length || 0) > 0 && (
+                                            <details className="mt-3 rounded-md border border-border bg-muted/20 p-3">
+                                                <summary className="cursor-pointer text-xs font-medium">VICIdial API evidence</summary>
+                                                <pre className="mt-3 max-h-64 overflow-auto whitespace-pre-wrap break-all text-xs text-muted-foreground">
+                                                    {JSON.stringify(selectedCall.external_metadata?.events, null, 2)}
+                                                </pre>
+                                            </details>
+                                        )}
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Transcript */}
+                            <div>
+                                <h3 className="font-semibold mb-2">Conversation ({selectedCall?.conversation_history.length || 0} messages)</h3>
+                                {!selectedCall ? (
+                                    <div className="bg-muted/30 rounded-lg p-4 text-sm text-muted-foreground">
+                                        Load the call to view the transcript
+                                    </div>
+                                ) : (
+                                    <div className="bg-muted/30 rounded-lg p-4 max-h-64 overflow-y-auto space-y-3">
+                                        {selectedCall.conversation_history.length === 0 ? (
+                                            <p className="text-muted-foreground text-sm">No conversation recorded</p>
+                                        ) : (
+                                            selectedCall.conversation_history.map((msg, i) => (
+                                                <div key={i} className={`flex ${msg.role === 'assistant' ? 'justify-start' : 'justify-end'}`}>
+                                                    <div className={`max-w-[80%] rounded-lg px-3 py-2 ${
+                                                        msg.role === 'assistant' 
+                                                            ? 'bg-primary/10 text-foreground' 
+                                                            : 'bg-muted text-foreground'
+                                                    }`}>
+                                                        <div className="text-xs text-muted-foreground mb-1 capitalize">{msg.role}</div>
+                                                        <div className="text-sm">{msg.content}</div>
+                                                        {msg.timestamp && (
+                                                            <div className="text-xs text-muted-foreground mt-1">
+                                                                {(() => {
+                                                                    const raw = msg.timestamp!;
+                                                                    const n = typeof raw === 'number' ? raw : (typeof raw === 'string' && /^\d+(\.\d+)?$/.test(raw) ? Number(raw) : NaN);
+                                                                    const ms = !isNaN(n) && n < 1e12 ? n * 1000 : (!isNaN(n) ? n : raw);
+                                                                    return new Date(ms).toLocaleTimeString();
+                                                                })()}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                            ))
+                                        )}
+                                    </div>
+                                )}
+                            </div>
+
+                            {/* Tool Executions — unified section grouping all phases */}
+                            {selectedCall && (() => {
+                                const preCall = selectedCall.pre_call_tool_calls || [];
+                                const inCall = selectedCall.tool_calls || [];
+                                const postCall = selectedCall.post_call_tool_calls || [];
+                                const total = preCall.length + inCall.length + postCall.length;
+                                if (total === 0) return null;
+                                const hasPending = postCall.some((t) => t?.status === 'pending') ||
+                                                   preCall.some((t) => t?.status === 'pending');
+                                return (
+                                    <div>
+                                        <div className="flex items-center justify-between mb-2">
+                                            <h3 className="font-semibold">Tool Executions ({total})</h3>
+                                            {hasPending && selectedCall && (
+                                                <button
+                                                    type="button"
+                                                    onClick={async () => {
+                                                        try {
+                                                            const res = await axios.get(`/api/calls/${selectedCall.id}`);
+                                                            setSelectedCall(res.data);
+                                                        } catch (err) {
+                                                            console.error('Failed to refresh call details:', err);
+                                                        }
+                                                    }}
+                                                    className="text-xs px-2 py-1 rounded bg-muted hover:bg-muted/80 text-muted-foreground"
+                                                    title="Refresh — some tools are still running"
+                                                >
+                                                    Refresh
+                                                </button>
+                                            )}
+                                        </div>
+                                        <div className="space-y-4">
+                                            {preCall.length > 0 && (
+                                                <PhaseToolGroup phase="pre_call" entries={preCall} />
+                                            )}
+                                            {inCall.length > 0 && (
+                                                <InCallToolGroup entries={inCall as any} />
+                                            )}
+                                            {postCall.length > 0 && (
+                                                <PhaseToolGroup phase="post_call" entries={postCall} />
+                                            )}
+                                        </div>
+                                    </div>
+                                );
+                            })()}
+
+                            {/* Error Message */}
+                            {modalCall.error_message && (
+                                <div>
+                                    <h3 className="font-semibold mb-2 text-destructive">Error</h3>
+                                    <div className="bg-destructive/10 border border-destructive/20 rounded-lg p-3 text-sm">
+                                        {modalCall.error_message}
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+};
+
+export default CallHistoryPage;

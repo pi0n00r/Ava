@@ -1,0 +1,2581 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/hkjarral/ava-ai-voice-agent-for-asterisk/cli/internal/check"
+	"github.com/hkjarral/ava-ai-voice-agent-for-asterisk/cli/internal/configmerge"
+	"github.com/spf13/cobra"
+)
+
+type rebuildMode string
+
+const (
+	rebuildAuto rebuildMode = "auto"
+	rebuildNone rebuildMode = "none"
+	rebuildAll  rebuildMode = "all"
+)
+
+type localChangesPolicy string
+
+const (
+	localChangesAsk       localChangesPolicy = "ask"
+	localChangesRetain    localChangesPolicy = "retain"
+	localChangesOverwrite localChangesPolicy = "overwrite"
+	localChangesAbort     localChangesPolicy = "abort"
+)
+
+var (
+	updateRemote         string
+	updateRef            string
+	updateNoStash        bool
+	updateStashUntracked bool
+	updateLocalChanges   string
+	updateRebuild        string
+	updateForceRecreate  bool
+	updateSkipCheck      bool
+	updateSelfUpdate     bool
+	updateIncludeUI      bool
+	updateCheckout       bool
+	updateBackupID       string
+	updatePlan           bool
+	updatePlanJSON       bool
+	gitSafeDirectory     string
+)
+
+var semverTagRe = regexp.MustCompile(`^(v)?([0-9]+\.[0-9]+\.[0-9]+)$`)
+
+func normalizeSemverTagRef(ref string) (string, bool) {
+	r := strings.TrimSpace(ref)
+	if r == "" {
+		return "", false
+	}
+	m := semverTagRe.FindStringSubmatch(r)
+	if m == nil {
+		return "", false
+	}
+	return "v" + m[2], true
+}
+
+var updateCmd = &cobra.Command{
+	Use:   "update",
+	Short: "Pull latest code and apply updates",
+	Long: `Update Asterisk AI Voice Agent to the latest code and apply changes safely.
+
+This command:
+  - Backs up operator config (.env, config/ai-agent.local.yaml, config/users.json, config/contexts/)
+  - Takes consistent SQLite snapshots of agents.db and call_history.db when present
+  - Also snapshots config/ai-agent.yaml for recovery/migration if it was edited locally
+  - Safely fast-forwards to origin/main (no forced merges by default)
+  - Preserves local tracked changes using git stash (optional)
+  - Rebuilds/restarts only the containers impacted by the change set
+  - Verifies success by running agent check (optional)
+
+Safety notes:
+  - If you edited config/ai-agent.yaml directly, updates can conflict. This updater automatically migrates
+    those edits into config/ai-agent.local.yaml and resets config/ai-agent.yaml back to upstream defaults.
+  - No hard resets are performed.
+  - Fast-forward only: if your branch has diverged, the update stops with guidance.`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runUpdate()
+	},
+}
+
+func init() {
+	updateCmd.Flags().StringVar(&updateRemote, "remote", "origin", "git remote name")
+	updateCmd.Flags().StringVar(&updateRef, "ref", "main", "git ref to update to (branch like main, or tag like v6.2.0)")
+	updateCmd.Flags().BoolVar(&updateNoStash, "no-stash", false, "abort if repo has local changes instead of stashing")
+	updateCmd.Flags().BoolVar(&updateStashUntracked, "stash-untracked", false, "include untracked files when stashing (does not include ignored files)")
+	updateCmd.Flags().StringVar(&updateLocalChanges, "local-changes", string(localChangesAsk), "how to handle tracked local changes: ask|retain|overwrite|abort")
+	updateCmd.Flags().StringVar(&updateRebuild, "rebuild", string(rebuildAuto), "rebuild mode: auto|none|all")
+	updateCmd.Flags().BoolVar(&updateForceRecreate, "force-recreate", false, "force recreate containers during docker compose up")
+	updateCmd.Flags().BoolVar(&updateSkipCheck, "skip-check", false, "skip running agent check after update")
+	updateCmd.Flags().BoolVar(&updateSelfUpdate, "self-update", true, "auto-update the agent CLI binary if a newer release is available")
+	updateCmd.Flags().BoolVar(&updateIncludeUI, "include-ui", true, "include admin_ui rebuild/restart when changes require it")
+	updateCmd.Flags().BoolVar(&updateCheckout, "checkout", false, "allow switching to --ref branch before updating (UI-driven updates typically enable this)")
+	updateCmd.Flags().StringVar(&updateBackupID, "backup-id", "", "use a stable backup identifier (creates .agent/update-backups/<id>)")
+	updateCmd.Flags().BoolVar(&updatePlan, "plan", false, "print the update plan (git/diff/docker actions) without applying it")
+	updateCmd.Flags().BoolVar(&updatePlanJSON, "plan-json", false, "when used with --plan, output the plan as JSON")
+	rootCmd.AddCommand(updateCmd)
+}
+
+type updateContext struct {
+	repoRoot  string
+	oldSHA    string
+	newSHA    string
+	backupDir string
+	stashed   bool
+	stashRef  string
+
+	changedFiles []string
+
+	servicesToRebuild map[string]bool
+	servicesToRestart map[string]bool
+	composeChanged    bool
+
+	// Local AI is optional. Keep the active-route selection signal separate
+	// from container existence so Docker actions can distinguish a selected,
+	// not-yet-created service from an unselected stopped service.
+	localAISelected      bool
+	localAIExisting      bool
+	localAIExistingKnown bool
+
+	skippedServices map[string]string // service -> "rebuild"|"restart" (filtered by flags)
+}
+
+type updatePlanReport struct {
+	RepoRoot         string            `json:"repo_root"`
+	Remote           string            `json:"remote"`
+	Ref              string            `json:"ref"`
+	CurrentBranch    string            `json:"current_branch"`
+	TargetBranch     string            `json:"target_branch"`
+	Checkout         bool              `json:"checkout"`
+	WouldCheckout    bool              `json:"would_checkout"`
+	OldSHA           string            `json:"old_sha"`
+	NewSHA           string            `json:"new_sha"`
+	Relation         string            `json:"relation"` // equal|behind|ahead|diverged
+	CodeChanged      bool              `json:"code_changed"`
+	UpdateAvailable  bool              `json:"update_available"`
+	Dirty            bool              `json:"dirty"`
+	NoStash          bool              `json:"no_stash"`
+	StashUntracked   bool              `json:"stash_untracked"`
+	LocalChanges     string            `json:"local_changes"`
+	WouldStash       bool              `json:"would_stash"`
+	WouldOverwrite   bool              `json:"would_overwrite"`
+	WouldAbort       bool              `json:"would_abort"`
+	RebuildMode      string            `json:"rebuild_mode"`
+	ComposeChanged   bool              `json:"compose_changed"`
+	ServicesRebuild  []string          `json:"services_rebuild"`
+	ServicesRestart  []string          `json:"services_restart"`
+	SkippedServices  map[string]string `json:"skipped_services,omitempty"`
+	ChangedFileCount int               `json:"changed_file_count"`
+	ChangedFiles     []string          `json:"changed_files,omitempty"`
+	FilesTruncated   bool              `json:"changed_files_truncated,omitempty"`
+	LocalFileCount   int               `json:"local_file_count"`
+	LocalFiles       []string          `json:"local_files,omitempty"`
+	LocalFilesTrunc  bool              `json:"local_files_truncated,omitempty"`
+	Warnings         []string          `json:"warnings,omitempty"`
+}
+
+func runUpdate() (retErr error) {
+	printUpdateStep("Preparing update")
+	if updateSelfUpdate {
+		maybeSelfUpdateAndReexec()
+	}
+
+	repoRoot, err := gitShowTopLevel()
+	if err != nil {
+		return err
+	}
+	if err := os.Chdir(repoRoot); err != nil {
+		return fmt.Errorf("failed to chdir to repo root: %w", err)
+	}
+
+	ctx := &updateContext{
+		repoRoot:          repoRoot,
+		servicesToRebuild: map[string]bool{},
+		servicesToRestart: map[string]bool{},
+		skippedServices:   map[string]string{},
+	}
+
+	defer func() {
+		if retErr != nil && !updatePlan {
+			printUpdateFailureRecovery(ctx, retErr)
+		}
+	}()
+
+	ctx.oldSHA, err = gitRevParse("HEAD")
+	if err != nil {
+		return err
+	}
+
+	// Plan-only: show what would happen without changing the repo or containers.
+	if updatePlan {
+		return runUpdatePlan(ctx)
+	}
+
+	releaseLock, err := acquireUpdateLock(ctx.repoRoot)
+	if err != nil {
+		return err
+	}
+	defer releaseLock()
+
+	printUpdateStep("Creating backups")
+	if err := createUpdateBackups(ctx); err != nil {
+		return err
+	}
+
+	tagRef, isTag := normalizeSemverTagRef(updateRef)
+	if isTag {
+		updateRef = tagRef
+		printUpdateStep(fmt.Sprintf("Fetching %s tag %s", updateRemote, updateRef))
+	} else {
+		printUpdateStep(fmt.Sprintf("Fetching %s/%s", updateRemote, updateRef))
+	}
+	if err := gitFetch(updateRemote, updateRef); err != nil {
+		return err
+	}
+	// Keep tags current so "git describe --tags" reflects newly published versions.
+	_ = gitFetchTags(updateRemote)
+	targetRemoteRef := fmt.Sprintf("%s/%s", updateRemote, updateRef)
+	targetRev := targetRemoteRef
+	if isTag {
+		targetRev = updateRef
+	}
+	targetLabel := targetRemoteRef
+	if isTag {
+		targetLabel = updateRef
+	}
+	targetSHA, err := gitRevParse(targetRev)
+	if err != nil {
+		return err
+	}
+	ctx.newSHA = targetSHA
+
+	currentBranch, _ := gitCurrentBranch()
+	branchMismatch := false
+	checkoutExistingBranch := false
+	branchHead := ctx.oldSHA
+	if isTag && (strings.TrimSpace(currentBranch) == "" || strings.TrimSpace(currentBranch) == "HEAD") {
+		return fmt.Errorf("cannot update to tag %q from a detached HEAD; checkout a branch (e.g., `git checkout main`) and re-run", updateRef)
+	}
+	if !isTag {
+		branchMismatch = strings.TrimSpace(currentBranch) == "" || strings.TrimSpace(currentBranch) == "HEAD" || strings.TrimSpace(currentBranch) != strings.TrimSpace(updateRef)
+		if branchMismatch {
+			if !updateCheckout {
+				return fmt.Errorf("target ref %q differs from current branch %q; re-run with --checkout to allow switching branches", updateRef, currentBranch)
+			}
+			exists, existsErr := gitLocalBranchExists(updateRef)
+			if existsErr != nil {
+				return existsErr
+			}
+			if exists {
+				checkoutExistingBranch = true
+				branchHead, err = gitRevParse(updateRef)
+				if err != nil {
+					return err
+				}
+			} else {
+				branchHead = targetSHA
+			}
+		}
+	}
+
+	updateAvailable, relErr := gitIsAncestor(branchHead, targetSHA)
+	if relErr != nil {
+		return relErr
+	}
+	remoteIsAncestor, relErr2 := gitIsAncestor(targetSHA, branchHead)
+	if relErr2 != nil {
+		return relErr2
+	}
+
+	finalSHA := branchHead
+	if strings.TrimSpace(branchHead) == strings.TrimSpace(targetSHA) {
+		printUpdateInfo("Already up to date on %s (%s)", updateRef, shortSHA(branchHead))
+		finalSHA = branchHead
+	} else if updateAvailable {
+		finalSHA = targetSHA
+	} else if remoteIsAncestor {
+		printUpdateInfo("Local branch is ahead of %s; skipping fast-forward update", targetLabel)
+		finalSHA = branchHead
+	} else {
+		return fmt.Errorf("cannot fast-forward: local branch has diverged from %s (resolve manually and re-run)", targetLabel)
+	}
+	ctx.newSHA = finalSHA
+
+	if strings.TrimSpace(ctx.oldSHA) != strings.TrimSpace(ctx.newSHA) {
+		ctx.changedFiles, err = gitDiffNames(ctx.oldSHA, ctx.newSHA)
+		if err != nil {
+			return err
+		}
+		decideDockerActions(ctx)
+		applyServiceFilters(ctx)
+		applyOptionalServiceFilters(ctx)
+		if err := preflightDockerChangeGuard(ctx); err != nil {
+			return err
+		}
+	}
+
+	printUpdateStep("Checking working tree")
+	localFiles, err := gitDirtyFiles(updateStashUntracked)
+	if err != nil {
+		return err
+	}
+	dirty := len(localFiles) > 0
+	localPolicy, err := resolveLocalChangesPolicy(dirty, localFiles)
+	if err != nil {
+		return err
+	}
+	if dirty {
+		switch localPolicy {
+		case localChangesAbort:
+			return errors.New("working tree has local changes; update aborted by local-change policy")
+		case localChangesOverwrite:
+			printUpdateInfo("Working tree is dirty; discarding local code changes after backing up operator config")
+			if err := gitDiscardLocalChanges(updateStashUntracked); err != nil {
+				return err
+			}
+		case localChangesRetain:
+			printUpdateInfo("Working tree is dirty; stashing local changes for restore after update")
+			if err := gitStash(ctx, updateStashUntracked); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("invalid local-change policy %q", localPolicy)
+		}
+	}
+
+	restoreOperatorConfigAfterMerge := dirty && localPolicy == localChangesOverwrite
+
+	if branchMismatch {
+		printUpdateStep(fmt.Sprintf("Checking out %s", updateRef))
+		if checkoutExistingBranch {
+			if err := gitCheckout(updateRef); err != nil {
+				return err
+			}
+		} else {
+			if err := gitCheckoutTrack(updateRef, targetRemoteRef); err != nil {
+				return err
+			}
+		}
+	}
+	if strings.TrimSpace(branchHead) != strings.TrimSpace(targetSHA) && updateAvailable {
+		printUpdateStep("Fast-forwarding code")
+		mergeRef := targetRemoteRef
+		if isTag {
+			mergeRef = updateRef
+		}
+		if err := gitMergeFastForward(mergeRef); err != nil {
+			return err
+		}
+	}
+
+	if restoreOperatorConfigAfterMerge {
+		printUpdateStep("Restoring operator config")
+		if err := restoreOperatorConfigFromBackup(ctx); err != nil {
+			return err
+		}
+	}
+
+	if ctx.stashed {
+		printUpdateStep("Restoring stashed changes")
+		if err := gitStashPop(ctx); err != nil {
+			printUpdateInfo("WARN: stash pop failed; preserving local code changes in git stash and recovering operator config from update backup: %v", err)
+			if recoverErr := recoverFromStashConflict(ctx); recoverErr != nil {
+				return fmt.Errorf("stash pop failed and automatic recovery failed; local changes are preserved in git stash and require manual resolution: %w", recoverErr)
+			}
+		}
+	}
+
+	// If the operator edited config/ai-agent.yaml directly (tracked), move those edits into
+	// config/ai-agent.local.yaml so future updates remain conflict-free and new upstream knobs
+	// are inherited by default.
+	if err := migrateBaseConfigEditsToLocal(); err != nil {
+		return err
+	}
+
+	printUpdateStep("Applying Docker changes")
+	printDockerActionsPlanned(ctx)
+	if err := applyDockerActions(ctx); err != nil {
+		return err
+	}
+
+	if updateSkipCheck {
+		printUpdateSummary(ctx, "", 0, 0)
+		return nil
+	}
+
+	printUpdateStep("Running agent check")
+	report, status, warnCount, failCount, err := runPostUpdateCheckWithRetry(60*time.Second, 5*time.Second)
+	printPostUpdateCheck(report, warnCount, failCount)
+	printUpdateSummary(ctx, status, warnCount, failCount)
+	if err != nil {
+		return err
+	}
+	if failCount > 0 {
+		return errors.New("post-update check reported failures")
+	}
+	return nil
+}
+
+func acquireUpdateLock(repoRoot string) (func(), error) {
+	lockDir := filepath.Join(repoRoot, ".agent", "updates")
+	if err := os.MkdirAll(lockDir, 0o755); err != nil {
+		return nil, fmt.Errorf("failed to create update lock directory: %w", err)
+	}
+	lockPath := filepath.Join(lockDir, "update.lock")
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open update lock: %w", err)
+	}
+	if err := lockUpdateFile(f); err != nil {
+		_ = f.Close()
+		return nil, errors.New("another agent update or rollback is already running")
+	}
+	_ = f.Truncate(0)
+	_, _ = f.Seek(0, 0)
+	_, _ = f.WriteString(fmt.Sprintf("pid=%d started_at=%s\n", os.Getpid(), time.Now().UTC().Format(time.RFC3339)))
+	return func() {
+		unlockUpdateFile(f)
+		_ = f.Close()
+	}, nil
+}
+
+func runUpdatePlan(ctx *updateContext) error {
+	localFiles, err := gitDirtyFiles(updateStashUntracked)
+	if err != nil {
+		return err
+	}
+	dirty := len(localFiles) > 0
+	localPolicy, err := requestedLocalChangesPolicy()
+	if err != nil {
+		return err
+	}
+	if updateNoStash {
+		if localPolicy != localChangesAsk && localPolicy != localChangesAbort {
+			return errors.New("--no-stash cannot be combined with --local-changes=retain or --local-changes=overwrite")
+		}
+		localPolicy = localChangesAbort
+	}
+
+	currentBranch, _ := gitCurrentBranch()
+	tagRef, isTag := normalizeSemverTagRef(updateRef)
+	if isTag {
+		updateRef = tagRef
+	}
+	wouldCheckout := !isTag && updateCheckout && (strings.TrimSpace(currentBranch) == "" || strings.TrimSpace(currentBranch) == "HEAD" || strings.TrimSpace(currentBranch) != strings.TrimSpace(updateRef))
+
+	if err := gitFetch(updateRemote, updateRef); err != nil {
+		return err
+	}
+	_ = gitFetchTags(updateRemote)
+
+	rev := fmt.Sprintf("%s/%s", updateRemote, updateRef)
+	if isTag {
+		rev = updateRef
+	}
+	newSHA, err := gitRevParse(rev)
+	if err != nil {
+		return err
+	}
+
+	ctx.newSHA = newSHA
+	updateAvailable, relErr := gitIsAncestor(ctx.oldSHA, ctx.newSHA)
+	if relErr != nil {
+		return relErr
+	}
+	remoteIsAncestor, relErr2 := gitIsAncestor(ctx.newSHA, ctx.oldSHA)
+	if relErr2 != nil {
+		return relErr2
+	}
+	codeChanged := strings.TrimSpace(ctx.oldSHA) != strings.TrimSpace(ctx.newSHA)
+	// Git treats a commit as its own ancestor, so when SHAs match `gitIsAncestor(old,new)` is true.
+	// For plan/reporting, treat identical SHAs as "no update available".
+	updateAvailable = updateAvailable && codeChanged
+	if codeChanged {
+		ctx.changedFiles, err = gitDiffNames(ctx.oldSHA, ctx.newSHA)
+		if err != nil {
+			return err
+		}
+		decideDockerActions(ctx)
+		applyServiceFilters(ctx)
+		applyOptionalServiceFilters(ctx)
+	} else {
+		ctx.changedFiles = nil
+	}
+
+	wouldStash := dirty && localPolicy == localChangesRetain
+	wouldOverwrite := dirty && localPolicy == localChangesOverwrite
+	wouldAbort := dirty && localPolicy == localChangesAbort
+
+	relation := "equal"
+	if codeChanged {
+		switch {
+		case updateAvailable:
+			relation = "behind"
+		case remoteIsAncestor:
+			relation = "ahead"
+		default:
+			relation = "diverged"
+		}
+	}
+
+	limit := 200
+	files := ctx.changedFiles
+	truncated := false
+	if len(files) > limit {
+		files = files[:limit]
+		truncated = true
+	}
+	localPreview := localFiles
+	localTruncated := false
+	if len(localPreview) > limit {
+		localPreview = localPreview[:limit]
+		localTruncated = true
+	}
+
+	rep := &updatePlanReport{
+		RepoRoot:         ctx.repoRoot,
+		Remote:           updateRemote,
+		Ref:              updateRef,
+		CurrentBranch:    strings.TrimSpace(currentBranch),
+		TargetBranch:     strings.TrimSpace(updateRef),
+		Checkout:         updateCheckout,
+		WouldCheckout:    wouldCheckout,
+		OldSHA:           ctx.oldSHA,
+		NewSHA:           ctx.newSHA,
+		Relation:         relation,
+		CodeChanged:      codeChanged,
+		UpdateAvailable:  updateAvailable,
+		Dirty:            dirty,
+		NoStash:          updateNoStash,
+		StashUntracked:   updateStashUntracked,
+		LocalChanges:     string(localPolicy),
+		WouldStash:       wouldStash,
+		WouldOverwrite:   wouldOverwrite,
+		WouldAbort:       wouldAbort,
+		RebuildMode:      strings.ToLower(strings.TrimSpace(updateRebuild)),
+		ComposeChanged:   ctx.composeChanged,
+		ServicesRebuild:  sortedKeys(ctx.servicesToRebuild),
+		ServicesRestart:  sortedKeys(ctx.servicesToRestart),
+		SkippedServices:  nil,
+		ChangedFileCount: len(ctx.changedFiles),
+		ChangedFiles:     files,
+		FilesTruncated:   truncated,
+		LocalFileCount:   len(localFiles),
+		LocalFiles:       localPreview,
+		LocalFilesTrunc:  localTruncated,
+	}
+	if len(ctx.skippedServices) > 0 {
+		rep.SkippedServices = ctx.skippedServices
+	}
+	if wouldCheckout && strings.TrimSpace(currentBranch) != "" && strings.TrimSpace(currentBranch) != "HEAD" && strings.TrimSpace(currentBranch) != strings.TrimSpace(updateRef) {
+		rep.Warnings = append(rep.Warnings, fmt.Sprintf("Selected ref %q differs from current branch %q; update will checkout/switch branches (use --checkout=false to disallow).", updateRef, currentBranch))
+	}
+	if !updateIncludeUI && (ctx.skippedServices["admin_ui"] != "") {
+		rep.Warnings = append(rep.Warnings, "Admin UI changes detected but excluded (use --include-ui to apply admin_ui rebuild/restart).")
+	}
+	if !updateIncludeUI && ctx.composeChanged {
+		rep.Warnings = append(rep.Warnings, "Compose files changed; admin_ui changes (if any) are excluded unless --include-ui is enabled.")
+	}
+	if reason := ctx.skippedServices["local_ai_server"]; strings.Contains(reason, "not installed") {
+		rep.Warnings = append(rep.Warnings, "Local AI Server changes were detected, but local_ai_server is neither installed nor selected by the active configuration; it will not be built or started.")
+	}
+	if !updateAvailable && remoteIsAncestor && strings.TrimSpace(ctx.newSHA) != strings.TrimSpace(ctx.oldSHA) {
+		rep.Warnings = append(rep.Warnings, fmt.Sprintf("Local branch is ahead of %s/%s; no fast-forward update available.", updateRemote, updateRef))
+	}
+	if !updateAvailable && !remoteIsAncestor && strings.TrimSpace(ctx.newSHA) != strings.TrimSpace(ctx.oldSHA) {
+		rep.Warnings = append(rep.Warnings, fmt.Sprintf("Local branch has diverged from %s/%s; update requires manual resolution.", updateRemote, updateRef))
+	}
+
+	if updatePlanJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(rep)
+	}
+
+	printUpdateStep("Update plan")
+	printUpdateInfo("Repo: %s", ctx.repoRoot)
+	printUpdateInfo("From: %s", shortSHA(ctx.oldSHA))
+	printUpdateInfo("To:   %s", shortSHA(ctx.newSHA))
+	if wouldAbort {
+		printUpdateInfo("Would abort: working tree is dirty and --no-stash was set")
+	} else if wouldStash {
+		printUpdateInfo("Would stash: working tree has local changes")
+	}
+	printDockerActionsPlanned(ctx)
+	if len(rep.Warnings) > 0 {
+		for _, w := range rep.Warnings {
+			printUpdateInfo("Warning: %s", w)
+		}
+	}
+	return nil
+}
+
+func applyServiceFilters(ctx *updateContext) {
+	// UI-driven updates may want to avoid restarting/rebuilding admin_ui by default.
+	if !updateIncludeUI {
+		if ctx.servicesToRebuild["admin_ui"] {
+			delete(ctx.servicesToRebuild, "admin_ui")
+			ctx.skippedServices["admin_ui"] = "rebuild"
+		}
+		if ctx.servicesToRestart["admin_ui"] {
+			delete(ctx.servicesToRestart, "admin_ui")
+			ctx.skippedServices["admin_ui"] = "restart"
+		}
+	}
+}
+
+var readActiveAgentRoutesForUpdate = readActiveAgentRoutes
+var aiEngineRunningForActiveRouteRead = aiEngineRunning
+var existingComposeServicesForUpdate = existingComposeServices
+var configuredActiveRouteUsesLocalAIForUpdate = configuredActiveRouteUsesLocalAI
+var detectLocalAIUpdateStateForUpdate = detectLocalAIUpdateState
+var runDockerCommandForUpdate = runCmd
+
+const activeAgentRouteReadTimeout = 15 * time.Second
+
+type localAIUpdateState struct {
+	selected       bool
+	selectionKnown bool
+	existing       bool
+	existingKnown  bool
+}
+
+type activeAgentRoute struct {
+	Provider  string  `json:"provider"`
+	ExtraJSON *string `json:"extra_json"`
+}
+
+func applyOptionalServiceFilters(ctx *updateContext) {
+	if !ctx.servicesToRebuild["local_ai_server"] && !ctx.servicesToRestart["local_ai_server"] {
+		return
+	}
+
+	state := detectLocalAIUpdateStateForUpdate()
+	ctx.localAISelected = state.selected
+	ctx.localAIExisting = state.existing
+	ctx.localAIExistingKnown = state.existingKnown
+
+	// A positive route selection may start a not-yet-created Local AI service,
+	// while an existing container remains eligible for an image refresh. Never
+	// create Local AI merely because --rebuild=all was requested or because
+	// route/existence detection failed.
+	if state.selected || state.existing {
+		return
+	}
+	// Preserve the existing fail-conservative plan when detection is incomplete;
+	// applyDockerActions will require a positive selection/existence signal
+	// before it can create, start, or image-build Local AI.
+	if !state.selectionKnown || !state.existingKnown {
+		return
+	}
+	if ctx.servicesToRebuild["local_ai_server"] {
+		delete(ctx.servicesToRebuild, "local_ai_server")
+		ctx.skippedServices["local_ai_server"] = "rebuild (not installed or selected)"
+	}
+	if ctx.servicesToRestart["local_ai_server"] {
+		delete(ctx.servicesToRestart, "local_ai_server")
+		ctx.skippedServices["local_ai_server"] = "restart (not installed or selected)"
+	}
+}
+
+func detectLocalAIUpdateState() localAIUpdateState {
+	existing, existingKnown := existingComposeServicesForUpdate()
+	selected, selectionKnown := configuredActiveRouteUsesLocalAIForUpdate()
+	return localAIUpdateState{
+		selected:       selected,
+		selectionKnown: selectionKnown,
+		existing:       existing["local_ai_server"],
+		existingKnown:  existingKnown,
+	}
+}
+
+func existingComposeServices() (map[string]bool, bool) {
+	out, err := runDockerCommandForUpdate("docker", "compose", "ps", "--services", "--all")
+	if err != nil {
+		out, err = runDockerCommandForUpdate("docker", "compose", "ps", "--services")
+	}
+	if err != nil {
+		return map[string]bool{}, false
+	}
+	services := map[string]bool{}
+	for _, line := range strings.Split(out, "\n") {
+		if service := strings.TrimSpace(line); service != "" {
+			services[service] = true
+		}
+	}
+	return services, true
+}
+
+func configuredActiveRouteUsesLocalAI() (bool, bool) {
+	cfg, known := readMergedOperatorConfig()
+	if !known {
+		return false, false
+	}
+	if activeRouteUsesLocalAI(cfg) {
+		return true, true
+	}
+
+	routes, routesKnown := readActiveAgentRoutesForUpdate()
+	if !routesKnown {
+		return false, false
+	}
+	return activeAgentRoutesUseLocalAI(routes, cfg)
+}
+
+func readMergedOperatorConfig() (map[string]any, bool) {
+	basePath := filepath.Join("config", "ai-agent.yaml")
+	base, err := configmerge.ReadYAMLFile(basePath)
+	if err != nil {
+		return nil, false
+	}
+	cfg := base
+	localPath := filepath.Join("config", "ai-agent.local.yaml")
+	if _, err := os.Stat(localPath); err == nil {
+		local, readErr := configmerge.ReadYAMLFile(localPath)
+		if readErr != nil {
+			return nil, false
+		}
+		cfg = configmerge.DeepMerge(cfg, local)
+	} else if !os.IsNotExist(err) {
+		return nil, false
+	}
+	return cfg, true
+}
+
+func activeRouteUsesLocalAI(cfg map[string]any) bool {
+	for _, field := range []string{"default_provider", "active_pipeline"} {
+		target, _ := cfg[field].(string)
+		if targetUsesLocalAI(strings.TrimSpace(target), cfg) {
+			return true
+		}
+	}
+	return false
+}
+
+func targetUsesLocalAI(target string, cfg map[string]any) bool {
+	if target == "" {
+		return false
+	}
+	providers, _ := cfg["providers"].(map[string]any)
+	if providerUsesLocalAI(target, providers[target]) {
+		return true
+	}
+
+	pipelines, _ := cfg["pipelines"].(map[string]any)
+	pipeline, _ := pipelines[target].(map[string]any)
+	for _, role := range []string{"stt", "llm", "tts"} {
+		providerKey, _ := pipeline[role].(string)
+		if providerUsesLocalAI(strings.TrimSpace(providerKey), providers[strings.TrimSpace(providerKey)]) {
+			return true
+		}
+	}
+	return false
+}
+
+func providerUsesLocalAI(providerKey string, raw any) bool {
+	if providerKey == "local" {
+		return true
+	}
+	provider, _ := raw.(map[string]any)
+	providerType, _ := provider["type"].(string)
+	return strings.EqualFold(strings.TrimSpace(providerType), "local")
+}
+
+func readActiveAgentRoutes() ([]activeAgentRoute, bool) {
+	dbPath := filepath.Join("data", "operator", "agents.db")
+
+	const script = `
+import json, os, sqlite3, sys
+db_path = sys.argv[1] if len(sys.argv) > 1 else os.getenv(
+    "AGENTS_DB_PATH", "/app/data/operator/agents.db"
+)
+db = sqlite3.connect("file:" + db_path + "?mode=ro", uri=True, timeout=5)
+try:
+    rows = db.execute(
+        "SELECT provider, extra_json FROM agents WHERE COALESCE(is_active, 1) = 1"
+    ).fetchall()
+    print(json.dumps([{"provider": row[0] or "", "extra_json": row[1]} for row in rows]))
+finally:
+    db.close()
+`
+
+	readCtx, cancel := context.WithTimeout(context.Background(), activeAgentRouteReadTimeout)
+	defer cancel()
+
+	cmd, known := activeAgentRouteReadCommand(readCtx, dbPath, script)
+	if !known {
+		// The Admin updater image deliberately has no Python runtime. If the
+		// engine is stopped and the host also lacks Python, route state is
+		// unknown and the caller conservatively retains Local AI.
+		return nil, false
+	}
+	if cmd == nil {
+		// A missing host database is a known empty state only when the engine is
+		// stopped. A running engine can use an env-configured or container-only
+		// database path, so that path is always queried inside the container.
+		return nil, true
+	}
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, false
+	}
+	var routes []activeAgentRoute
+	if err := json.Unmarshal(bytes.TrimSpace(out), &routes); err != nil {
+		return nil, false
+	}
+	return routes, true
+}
+
+func activeAgentRouteReadCommand(ctx context.Context, dbPath, script string) (*exec.Cmd, bool) {
+	if aiEngineRunningForActiveRouteRead() {
+		return exec.CommandContext(ctx, "docker", "exec", "ai_engine", "python3", "-c", script), true
+	}
+	if _, err := os.Stat(dbPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil, true
+		}
+		return nil, false
+	}
+	pythonPath, err := exec.LookPath("python3")
+	if err != nil {
+		return nil, false
+	}
+	return exec.CommandContext(ctx, pythonPath, "-c", script, dbPath), true
+}
+
+func activeAgentRoutesUseLocalAI(routes []activeAgentRoute, cfg map[string]any) (bool, bool) {
+	for _, route := range routes {
+		if targetUsesLocalAI(strings.TrimSpace(route.Provider), cfg) {
+			return true, true
+		}
+		if route.ExtraJSON == nil || strings.TrimSpace(*route.ExtraJSON) == "" {
+			continue
+		}
+		var extra map[string]any
+		if err := json.Unmarshal([]byte(*route.ExtraJSON), &extra); err != nil {
+			return false, false
+		}
+		pipeline, _ := extra["pipeline"].(string)
+		if targetUsesLocalAI(strings.TrimSpace(pipeline), cfg) {
+			return true, true
+		}
+	}
+	return false, true
+}
+
+func maybeSelfUpdateAndReexec() {
+	// Avoid infinite loops if we successfully replaced ourselves and re-exec'd.
+	if os.Getenv("AAVA_AGENT_SKIP_SELF_UPDATE") == "1" {
+		return
+	}
+	if runtime.GOOS == "windows" {
+		// Windows in-place replacement is unreliable (binary-in-use); fall back to the installer hint.
+		printSelfUpdateHint()
+		return
+	}
+
+	current := strings.TrimSpace(version)
+	if !strings.HasPrefix(strings.ToLower(current), "v") {
+		// dev builds: best-effort hint only
+		printSelfUpdateHint()
+		return
+	}
+
+	latest, err := fetchLatestReleaseTag(context.Background(), "hkjarral/AVA-AI-Voice-Agent-for-Asterisk")
+	if err != nil || latest == "" {
+		return
+	}
+	if compareSemver(current, latest) >= 0 {
+		return
+	}
+
+	exePath, err := os.Executable()
+	if err != nil || exePath == "" {
+		printSelfUpdateHint()
+		return
+	}
+	if resolved, err := filepath.EvalSymlinks(exePath); err == nil && resolved != "" {
+		exePath = resolved
+	}
+
+	binName, ok := releaseBinaryName(runtime.GOOS, runtime.GOARCH)
+	if !ok {
+		printSelfUpdateHint()
+		return
+	}
+
+	if err := selfUpdateFromGitHubRelease(latest, binName, exePath); err != nil {
+		printSelfUpdateHint()
+		return
+	}
+
+	// Re-exec into the updated binary so the rest of `agent update` runs the newest logic.
+	env := append(os.Environ(), "AAVA_AGENT_SKIP_SELF_UPDATE=1")
+	args := append([]string{exePath}, os.Args[1:]...)
+	execReplace(exePath, args, env)
+}
+
+func releaseBinaryName(goos string, goarch string) (string, bool) {
+	switch goos {
+	case "linux":
+		switch goarch {
+		case "amd64":
+			return "agent-linux-amd64", true
+		case "arm64":
+			return "agent-linux-arm64", true
+		}
+	case "darwin":
+		switch goarch {
+		case "amd64":
+			return "agent-darwin-amd64", true
+		case "arm64":
+			return "agent-darwin-arm64", true
+		}
+	case "windows":
+		if goarch == "amd64" {
+			return "agent-windows-amd64.exe", true
+		}
+	}
+	return "", false
+}
+
+func selfUpdateFromGitHubRelease(tag string, binName string, installPath string) error {
+	installDir := filepath.Dir(installPath)
+	if installDir == "" {
+		return errors.New("invalid install path")
+	}
+	if err := ensureWritableDir(installDir); err != nil {
+		return err
+	}
+
+	base := fmt.Sprintf("https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/releases/download/%s", tag)
+	binURL := base + "/" + binName
+	sumsURL := base + "/SHA256SUMS"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	sums, err := httpGetBytes(ctx, sumsURL)
+	if err != nil {
+		return err
+	}
+	expected, err := parseSHA256SUMS(sums, binName)
+	if err != nil {
+		return err
+	}
+
+	payload, err := httpGetBytes(ctx, binURL)
+	if err != nil {
+		return err
+	}
+	actual := fmt.Sprintf("%x", sha256.Sum256(payload))
+	if !strings.EqualFold(actual, expected) {
+		return fmt.Errorf("checksum mismatch for %s", binName)
+	}
+
+	// Backup existing binary (best-effort).
+	if _, err := os.Stat(installPath); err == nil {
+		bak := filepath.Join(installDir, "agent.bak."+time.Now().UTC().Format("20060102_150405"))
+		_ = copyFile(installPath, bak)
+	}
+
+	tmp := filepath.Join(installDir, ".agent.new."+strconv.Itoa(os.Getpid()))
+	if err := os.WriteFile(tmp, payload, 0o755); err != nil {
+		return err
+	}
+	_ = os.Chmod(tmp, 0o755)
+
+	if err := os.Rename(tmp, installPath); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+func httpGetBytes(ctx context.Context, url string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "aava-agent-cli")
+	client := &http.Client{Timeout: 25 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("GET %s failed: %s", url, resp.Status)
+	}
+	return io.ReadAll(resp.Body)
+}
+
+func parseSHA256SUMS(sums []byte, filename string) (string, error) {
+	for _, line := range strings.Split(string(sums), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) < 2 {
+			continue
+		}
+		hash := strings.TrimSpace(parts[0])
+		name := strings.TrimSpace(parts[1])
+		if name == filename {
+			if len(hash) != 64 {
+				return "", fmt.Errorf("invalid sha256 length for %s", filename)
+			}
+			return hash, nil
+		}
+	}
+	return "", fmt.Errorf("checksum for %s not found in SHA256SUMS", filename)
+}
+
+func ensureWritableDir(dir string) error {
+	testPath := filepath.Join(dir, ".agent.write-test."+strconv.Itoa(os.Getpid()))
+	if err := os.WriteFile(testPath, []byte("x"), 0o600); err != nil {
+		return err
+	}
+	_ = os.Remove(testPath)
+	return nil
+}
+
+func printSelfUpdateHint() {
+	latest, err := fetchLatestReleaseTag(context.Background(), "hkjarral/AVA-AI-Voice-Agent-for-Asterisk")
+	if err != nil || latest == "" {
+		return
+	}
+	current := strings.TrimSpace(version)
+	if !strings.HasPrefix(strings.ToLower(current), "v") {
+		// dev builds or unknown formats are best-effort only.
+		return
+	}
+	if compareSemver(current, latest) >= 0 {
+		return
+	}
+	fmt.Printf("Notice: a newer agent CLI is available (%s -> %s). Update with:\n", current, latest)
+	fmt.Printf("  curl -sSL https://raw.githubusercontent.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/main/scripts/install-cli.sh | bash\n")
+}
+
+func fetchLatestReleaseTag(ctx context.Context, repo string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+
+	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", repo)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "aava-agent-cli")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("unexpected status %s", resp.Status)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	var payload struct {
+		TagName string `json:"tag_name"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", err
+	}
+	tag := strings.TrimSpace(payload.TagName)
+	if tag == "" {
+		return "", errors.New("missing tag_name in response")
+	}
+	return tag, nil
+}
+
+func compareSemver(a string, b string) int {
+	amaj, amin, apat, okA := parseSemver(a)
+	bmaj, bmin, bpat, okB := parseSemver(b)
+	if !okA || !okB {
+		return 0
+	}
+	if amaj != bmaj {
+		if amaj < bmaj {
+			return -1
+		}
+		return 1
+	}
+	if amin != bmin {
+		if amin < bmin {
+			return -1
+		}
+		return 1
+	}
+	if apat != bpat {
+		if apat < bpat {
+			return -1
+		}
+		return 1
+	}
+	return 0
+}
+
+func parseSemver(v string) (major int, minor int, patch int, ok bool) {
+	v = strings.TrimSpace(v)
+	v = strings.TrimPrefix(strings.ToLower(v), "v")
+	if v == "" {
+		return 0, 0, 0, false
+	}
+	if i := strings.IndexByte(v, '-'); i >= 0 {
+		v = v[:i]
+	}
+	parts := strings.Split(v, ".")
+	if len(parts) < 3 {
+		return 0, 0, 0, false
+	}
+	maj, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0, 0, false
+	}
+	min, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, 0, 0, false
+	}
+	pat, err := strconv.Atoi(parts[2])
+	if err != nil {
+		return 0, 0, 0, false
+	}
+	return maj, min, pat, true
+}
+
+func createUpdateBackups(ctx *updateContext) error {
+	id := strings.TrimSpace(updateBackupID)
+	if id != "" {
+		id = sanitizeBackupID(id)
+		if id == "" {
+			return errors.New("invalid --backup-id")
+		}
+	}
+
+	dirName := time.Now().UTC().Format("20060102_150405")
+	if id != "" {
+		dirName = id
+	}
+
+	backupDir := filepath.Join(ctx.repoRoot, ".agent", "update-backups", dirName)
+	if err := os.MkdirAll(backupDir, 0o755); err != nil {
+		return fmt.Errorf("failed to create backup directory: %w", err)
+	}
+	ctx.backupDir = backupDir
+
+	paths := []string{
+		".env",
+		filepath.Join("config", "ai-agent.yaml"),
+		filepath.Join("config", "ai-agent.local.yaml"),
+		filepath.Join("config", "users.json"),
+		filepath.Join("config", "contexts"),
+	}
+
+	for _, rel := range paths {
+		if err := backupPathIfExists(rel, backupDir); err != nil {
+			return err
+		}
+	}
+	for _, rel := range []string{
+		filepath.Join("data", "operator", "agents.db"),
+		filepath.Join("data", "call_history.db"),
+	} {
+		if err := backupSQLiteIfExists(rel, backupDir); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// backupSQLiteIfExists uses SQLite's online backup API inside ai_engine. A raw
+// file copy can miss committed pages that are still in the WAL and is not a
+// safe pre-migration backup while calls are active.
+//
+// When the ai_engine container is not running (a common recovery context for
+// running an update), the online-backup path is unavailable. In that case we
+// fall back to a host-side file copy of the .db plus its -wal/-shm sidecars,
+// which is safe precisely because a stopped engine means there are no concurrent
+// writers. Aborting the whole update just because the engine is down would defeat
+// the purpose, so we never fail here on a stopped container.
+func backupSQLiteIfExists(relPath, backupRoot string) error {
+	if _, err := os.Stat(relPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to stat %s: %w", relPath, err)
+	}
+
+	if !aiEngineRunning() {
+		printUpdateInfo("ai_engine not running; copying %s (and WAL/SHM) from host", relPath)
+		return backupSQLiteHostCopy(relPath, backupRoot)
+	}
+
+	tmpName := fmt.Sprintf(".agent-sqlite-backup-%d-%s", os.Getpid(), filepath.Base(relPath))
+	hostTmp := filepath.Join("data", tmpName)
+	containerSrc := "/app/" + filepath.ToSlash(relPath)
+	containerTmp := "/app/data/" + tmpName
+	const script = `
+import sqlite3, sys
+src = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True, timeout=30)
+dst = sqlite3.connect(sys.argv[2])
+with dst:
+    src.backup(dst)
+dst.close(); src.close()
+`
+	cmd := exec.Command("docker", "exec", "ai_engine", "python3", "-c", script, containerSrc, containerTmp)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		// The container looked up as running but the exec failed (e.g. it became
+		// unhealthy mid-update). Fall back to a host copy rather than aborting.
+		printUpdateInfo("online SQLite backup failed for %s (%s); falling back to host copy", relPath, strings.TrimSpace(string(out)))
+		return backupSQLiteHostCopy(relPath, backupRoot)
+	}
+	defer os.Remove(hostTmp)
+	dst := filepath.Join(backupRoot, relPath)
+	if err := copyFile(hostTmp, dst); err != nil {
+		return err
+	}
+	printUpdateInfo("SQLite snapshot: %s", relPath)
+	return nil
+}
+
+// aiEngineRunning reports whether the ai_engine container is currently running.
+// A non-running or unreachable container (docker absent, daemon down) returns
+// false so callers fall back to a host-side copy.
+func aiEngineRunning() bool {
+	out, err := runCmd("docker", "ps", "--filter", "name=^ai_engine$", "--filter", "status=running", "--format", "{{.Names}}")
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.TrimSpace(line) == "ai_engine" {
+			return true
+		}
+	}
+	return false
+}
+
+// backupSQLiteHostCopy copies a SQLite DB and any -wal/-shm sidecars directly
+// from the host filesystem. Only valid when no process is writing the DB (i.e.
+// the engine is stopped); missing sidecars are skipped.
+func backupSQLiteHostCopy(relPath, backupRoot string) error {
+	dst := filepath.Join(backupRoot, relPath)
+	if err := copyFile(relPath, dst); err != nil {
+		return err
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		sidecar := relPath + suffix
+		if _, err := os.Stat(sidecar); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("failed to stat %s: %w", sidecar, err)
+		}
+		if err := copyFile(sidecar, filepath.Join(backupRoot, sidecar)); err != nil {
+			return err
+		}
+	}
+	printUpdateInfo("SQLite host copy: %s", relPath)
+	return nil
+}
+
+func sanitizeBackupID(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if len(s) > 80 {
+		s = s[:80]
+	}
+	var out strings.Builder
+	out.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z':
+			out.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			out.WriteRune(r)
+		case r >= '0' && r <= '9':
+			out.WriteRune(r)
+		case r == '-' || r == '_' || r == '.':
+			out.WriteRune(r)
+		default:
+			out.WriteByte('_')
+		}
+	}
+	return strings.Trim(out.String(), "._-")
+}
+
+func backupPathIfExists(relPath string, backupRoot string) error {
+	info, err := os.Stat(relPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to stat %s: %w", relPath, err)
+	}
+	dst := filepath.Join(backupRoot, relPath)
+	if info.IsDir() {
+		return copyDir(relPath, dst)
+	}
+	return copyFile(relPath, dst)
+}
+
+func copyFile(src string, dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return fmt.Errorf("failed to create backup dir for %s: %w", dst, err)
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("failed to open %s: %w", src, err)
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return fmt.Errorf("failed to create %s: %w", dst, err)
+	}
+	defer func() {
+		_ = out.Close()
+	}()
+	if _, err := io.Copy(out, in); err != nil {
+		return fmt.Errorf("failed to copy %s -> %s: %w", src, dst, err)
+	}
+	if err := out.Sync(); err != nil {
+		return fmt.Errorf("failed to sync %s: %w", dst, err)
+	}
+	return nil
+}
+
+func copyDir(srcDir string, dstDir string) error {
+	return filepath.WalkDir(srcDir, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(srcDir, path)
+		if err != nil {
+			return err
+		}
+		dstPath := filepath.Join(dstDir, rel)
+		if entry.IsDir() {
+			return os.MkdirAll(dstPath, 0o755)
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			// Skip symlinks in backups; they are uncommon here and can point outside the repo.
+			return nil
+		}
+		return copyFile(path, dstPath)
+	})
+}
+
+func gitShowTopLevel() (string, error) {
+	if _, err := exec.LookPath("git"); err != nil {
+		return "", errors.New("git not found in PATH")
+	}
+
+	// Work around Git's "dubious ownership" guardrail by setting safe.directory
+	// to the detected repo root (if we can find it without invoking git).
+	if gitSafeDirectory == "" {
+		if candidate, err := findGitRootFromCWD(); err == nil && candidate != "" {
+			gitSafeDirectory = candidate
+		}
+	}
+
+	out, err := runGitCmd("rev-parse", "--show-toplevel")
+	if err != nil {
+		// If we're hitting Git's safe.directory guardrail, print a human-friendly message
+		// that explains the cause and the exact one-time fix.
+		msg := err.Error()
+		if strings.Contains(msg, "detected dubious ownership") && strings.Contains(msg, "safe.directory") {
+			return "", fmt.Errorf(
+				"git safety check blocked this repo (detected 'dubious ownership').\n"+
+					"This happens when the repo directory is owned by a different user (common with Docker/UID-mapped setups).\n\n"+
+					"Fix (one-time):\n"+
+					"  git config --global --add safe.directory %s\n",
+				bestEffortCWD(),
+			)
+		}
+		return "", fmt.Errorf("not a git repository (or git not installed): %w", err)
+	}
+	top := strings.TrimSpace(out)
+	if top == "" {
+		return "", errors.New("git rev-parse returned empty repo root")
+	}
+	if abs, err := filepath.Abs(top); err == nil {
+		top = abs
+	}
+	gitSafeDirectory = top
+	return top, nil
+}
+
+func gitRevParse(ref string) (string, error) {
+	out, err := runGitCmd("rev-parse", ref)
+	if err != nil {
+		return "", fmt.Errorf("git rev-parse %s failed: %w", ref, err)
+	}
+	return strings.TrimSpace(out), nil
+}
+
+func gitIsDirty(includeUntracked bool) (bool, error) {
+	files, err := gitDirtyFiles(includeUntracked)
+	if err != nil {
+		return false, err
+	}
+	return len(files) > 0, nil
+}
+
+func gitDirtyFiles(includeUntracked bool) ([]string, error) {
+	args := []string{"status", "--porcelain"}
+	// Default behavior: ignore untracked files so operator backup artifacts (e.g., *.bak, .preflight-ok)
+	// don't force a stash attempt on every update run. Use --stash-untracked to include them.
+	if includeUntracked {
+		args = append(args, "--untracked-files=all")
+	} else {
+		args = append(args, "--untracked-files=no")
+	}
+	out, err := runGitCmd(args...)
+	if err != nil {
+		return nil, fmt.Errorf("git status failed: %w", err)
+	}
+	lines := []string{}
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if len(line) > 3 {
+			lines = append(lines, strings.TrimSpace(line[3:]))
+		} else {
+			lines = append(lines, line)
+		}
+	}
+	sort.Strings(lines)
+	return lines, nil
+}
+
+func requestedLocalChangesPolicy() (localChangesPolicy, error) {
+	p := strings.ToLower(strings.TrimSpace(updateLocalChanges))
+	if p == "" {
+		p = string(localChangesAsk)
+	}
+	switch localChangesPolicy(p) {
+	case localChangesAsk, localChangesRetain, localChangesOverwrite, localChangesAbort:
+		return localChangesPolicy(p), nil
+	default:
+		return "", fmt.Errorf("invalid --local-changes value %q (expected ask, retain, overwrite, or abort)", updateLocalChanges)
+	}
+}
+
+func stdinIsTerminal() bool {
+	info, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return (info.Mode() & os.ModeCharDevice) != 0
+}
+
+func resolveLocalChangesPolicy(dirty bool, localFiles []string) (localChangesPolicy, error) {
+	policy, err := requestedLocalChangesPolicy()
+	if err != nil {
+		return "", err
+	}
+	if updateNoStash {
+		if policy != localChangesAsk && policy != localChangesAbort {
+			return "", errors.New("--no-stash cannot be combined with --local-changes=retain or --local-changes=overwrite")
+		}
+		return localChangesAbort, nil
+	}
+	if !dirty || policy != localChangesAsk {
+		return policy, nil
+	}
+	if !stdinIsTerminal() {
+		return "", errors.New("working tree has local changes; re-run with --local-changes=retain, --local-changes=overwrite, or --local-changes=abort")
+	}
+
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "Local tracked changes were found before updating:")
+	limit := 20
+	for i, f := range localFiles {
+		if i >= limit {
+			fmt.Fprintf(os.Stderr, "  ... and %d more\n", len(localFiles)-limit)
+			break
+		}
+		fmt.Fprintf(os.Stderr, "  %s\n", f)
+	}
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "Choose how to handle these changes:")
+	fmt.Fprintln(os.Stderr, "  r) retain    stash and reapply them after the update (may conflict)")
+	fmt.Fprintln(os.Stderr, "  o) overwrite discard tracked local code edits; restore operator config from backup")
+	fmt.Fprintln(os.Stderr, "  a) abort     stop before changing the checkout")
+	fmt.Fprint(os.Stderr, "Selection [a]: ")
+
+	reader := bufio.NewReader(os.Stdin)
+	answer, _ := reader.ReadString('\n')
+	answer = strings.ToLower(strings.TrimSpace(answer))
+	switch answer {
+	case "r", "retain":
+		return localChangesRetain, nil
+	case "o", "overwrite":
+		return localChangesOverwrite, nil
+	case "", "a", "abort":
+		return localChangesAbort, nil
+	default:
+		return "", fmt.Errorf("unrecognized local-change selection %q", answer)
+	}
+}
+
+func gitDiscardLocalChanges(includeUntracked bool) error {
+	if _, err := runGitCmd("reset", "--hard", "HEAD"); err != nil {
+		return fmt.Errorf("git reset --hard HEAD failed while discarding tracked local changes: %w", err)
+	}
+	if includeUntracked {
+		if _, err := runGitCmd("clean", "-fd"); err != nil {
+			return fmt.Errorf("git clean -fd failed while discarding untracked local changes: %w", err)
+		}
+	}
+	return nil
+}
+
+func gitStash(ctx *updateContext, includeUntracked bool) error {
+	msg := "agent update " + time.Now().UTC().Format(time.RFC3339)
+	var err error
+	var out string
+
+	if includeUntracked {
+		out, err = runGitCmd("stash", "save", "-u", msg)
+	} else {
+		out, err = runGitCmd("stash", "save", msg)
+	}
+	if err != nil {
+		return fmt.Errorf("git stash failed: %w", err)
+	}
+
+	// If there was nothing to stash, git prints a message and does not create an entry.
+	if strings.Contains(out, "No local changes") {
+		return nil
+	}
+
+	ctx.stashed = true
+	ctx.stashRef = ""
+	ref, refErr := runGitCmd("stash", "list", "-1")
+	if refErr == nil {
+		ctx.stashRef = strings.TrimSpace(ref)
+	}
+	return nil
+}
+
+func gitStashPop(ctx *updateContext) error {
+	_, err := runGitCmd("stash", "pop")
+	if err != nil {
+		// On conflict, git typically returns non-zero and leaves the stash in place.
+		return fmt.Errorf("git stash pop failed (possible conflicts). Your stash is likely preserved; run `git stash list` and resolve conflicts: %w", err)
+	}
+	return nil
+}
+
+// recoverFromStashConflict handles a failed git stash pop by resetting the conflicted
+// working tree and restoring operator-owned config files from the pre-update backup.
+// The failed stash entry is intentionally kept so local code edits are not lost.
+func recoverFromStashConflict(ctx *updateContext) error {
+	// 1. Reset the conflicted working tree to the (already merged) HEAD.
+	if err := gitDiscardLocalChanges(updateStashUntracked); err != nil {
+		return err
+	}
+
+	// 2. Restore operator config from the backup created earlier in this run.
+	if err := restoreOperatorConfigFromBackup(ctx); err != nil {
+		return err
+	}
+	printUpdateInfo("Local code changes remain in git stash; inspect with `git stash list`")
+	return nil
+}
+
+func restoreOperatorConfigFromBackup(ctx *updateContext) error {
+	if ctx.backupDir == "" {
+		return errors.New("no backup directory available for recovery")
+	}
+
+	// Restore operator-owned files. Do NOT restore config/ai-agent.yaml over the updated upstream base.
+	// If the operator had edits in ai-agent.yaml, we migrate them into ai-agent.local.yaml below.
+	configFiles := []string{
+		".env",
+		filepath.Join("config", "ai-agent.local.yaml"),
+		filepath.Join("config", "users.json"),
+	}
+
+	for _, rel := range configFiles {
+		src := filepath.Join(ctx.backupDir, rel)
+		if _, err := os.Stat(src); err != nil {
+			continue // backup didn't include this file (e.g. local.yaml may not exist yet)
+		}
+		if err := copyFile(src, rel); err != nil {
+			return fmt.Errorf("failed to restore %s from backup: %w", rel, err)
+		}
+		printUpdateInfo("Restored %s", rel)
+	}
+
+	// Restore contexts directory if backed up.
+	ctxSrc := filepath.Join(ctx.backupDir, "config", "contexts")
+	if info, err := os.Stat(ctxSrc); err == nil && info.IsDir() {
+		ctxDst := filepath.Join("config", "contexts")
+		_ = os.RemoveAll(ctxDst)
+		if err := copyDir(ctxSrc, ctxDst); err != nil {
+			return fmt.Errorf("failed to restore config/contexts from backup: %w", err)
+		}
+		printUpdateInfo("Restored config/contexts/")
+	}
+
+	ctx.stashed = false
+
+	// Best-effort: if backup included ai-agent.yaml edits, migrate them into ai-agent.local.yaml.
+	// Fall back to restoring the base file only if migration fails due to YAML parse errors.
+	backupBase := filepath.Join(ctx.backupDir, "config", "ai-agent.yaml")
+	if _, err := os.Stat(backupBase); err == nil {
+		if err := migrateBackupBaseConfigEditsToLocal(ctx.oldSHA, backupBase); err != nil {
+			printUpdateInfo("WARN: failed to migrate backed-up ai-agent.yaml edits into ai-agent.local.yaml: %v", err)
+			// Conservative fallback: restore backup ai-agent.yaml so operator config isn't silently lost.
+			// This may reintroduce drift; operators should move overrides into ai-agent.local.yaml.
+			if copyErr := copyFile(backupBase, filepath.Join("config", "ai-agent.yaml")); copyErr == nil {
+				printUpdateInfo("Restored config/ai-agent.yaml (fallback)")
+			} else {
+				printUpdateInfo(
+					"WARN: could not restore backup ai-agent.yaml either: %v (backup still at %s)",
+					copyErr,
+					ctx.backupDir,
+				)
+			}
+		}
+	}
+	return nil
+}
+
+func gitFetch(remote string, ref string) error {
+	remote = strings.TrimSpace(remote)
+	ref = strings.TrimSpace(ref)
+	if remote == "" || ref == "" {
+		return errors.New("git fetch: remote/ref is empty")
+	}
+
+	// Defense-in-depth: avoid git option injection via remote names (git interprets args starting
+	// with '-' as options even when passed via exec.Command).
+	if strings.HasPrefix(remote, "-") || strings.ContainsAny(remote, " \t\r\n") {
+		return fmt.Errorf("invalid git remote %q", remote)
+	}
+
+	// Defense-in-depth: avoid git option injection via ref names (git interprets args starting
+	// with '-' as options even when passed via exec.Command).
+	if strings.HasPrefix(ref, "-") || strings.ContainsAny(ref, " \t\r\n") {
+		return fmt.Errorf("invalid git ref %q", ref)
+	}
+
+	// Normalize common ref inputs.
+	ref = strings.TrimPrefix(ref, "refs/heads/")
+	ref = strings.TrimPrefix(ref, "refs/tags/")
+	ref = strings.TrimPrefix(ref, remote+"/")
+
+	// Semver tag refs (vX.Y.Z) are fetched as tags, not remote-tracking branches.
+	if tag, ok := normalizeSemverTagRef(ref); ok {
+		refspec := fmt.Sprintf("+refs/tags/%s:refs/tags/%s", tag, tag)
+		_, err := runGitCmd("fetch", "--prune", remote, refspec)
+		if err != nil {
+			return fmt.Errorf("git fetch --prune %s %s failed: %w", remote, refspec, err)
+		}
+		return nil
+	}
+
+	// Ensure the remote-tracking ref (refs/remotes/<remote>/<ref>) is updated.
+	// `git fetch <remote> <ref>` updates FETCH_HEAD but does not always advance origin/<ref>
+	// depending on the remote's fetch refspec. Using an explicit refspec prevents false "up to date"
+	// decisions when we later read origin/<ref>.
+	refspec := fmt.Sprintf("+refs/heads/%s:refs/remotes/%s/%s", ref, remote, ref)
+	_, err := runGitCmd("fetch", "--prune", remote, refspec)
+	if err != nil {
+		return fmt.Errorf("git fetch --prune %s %s failed: %w", remote, ref, err)
+	}
+	return nil
+}
+
+func migrateBackupBaseConfigEditsToLocal(oldSHA string, backupBasePath string) error {
+	// Determine what the operator changed in ai-agent.yaml prior to the update, then carry only those
+	// edits forward into ai-agent.local.yaml. This avoids freezing upstream defaults when the base file
+	// changes between releases.
+	baseBefore, err := gitShowYAMLMap(oldSHA, filepath.Join("config", "ai-agent.yaml"))
+	if err != nil {
+		return err
+	}
+	backupBase, err := configmerge.ReadYAMLFile(backupBasePath)
+	if err != nil {
+		return err
+	}
+
+	patch := configmerge.ComputeOverrideNoDeletes(baseBefore, backupBase)
+	localPath := filepath.Join("config", "ai-agent.local.yaml")
+	local := map[string]any{}
+	if _, statErr := os.Stat(localPath); statErr == nil {
+		m, err := configmerge.ReadYAMLFile(localPath)
+		if err != nil {
+			return fmt.Errorf("failed to parse existing %s during migration: %w", localPath, err)
+		}
+		if m != nil {
+			local = m
+		}
+	} else if !os.IsNotExist(statErr) {
+		return fmt.Errorf("failed to stat %s: %w", localPath, statErr)
+	}
+
+	mergedLocal := configmerge.DeepMerge(local, patch)
+	if err := configmerge.WriteYAMLFileAtomic(localPath, mergedLocal); err != nil {
+		return err
+	}
+	// Ensure base file is reset to upstream version.
+	if _, err := runGitCmd("checkout", "--", filepath.Join("config", "ai-agent.yaml")); err != nil {
+		return fmt.Errorf("failed to reset %s to upstream: %w", filepath.Join("config", "ai-agent.yaml"), err)
+	}
+	return nil
+}
+
+func migrateBaseConfigEditsToLocal() error {
+	baseRel := filepath.Join("config", "ai-agent.yaml")
+	modified, err := gitFileModified(baseRel)
+	if err != nil {
+		return err
+	}
+	if !modified {
+		return nil
+	}
+
+	printUpdateStep("Migrating operator config into ai-agent.local.yaml")
+
+	baseClean, err := gitShowYAMLMap("HEAD", baseRel)
+	if err != nil {
+		return err
+	}
+
+	baseWorking, err := configmerge.ReadYAMLFile(baseRel)
+	if err != nil {
+		return err
+	}
+	patch := configmerge.ComputeOverrideNoDeletes(baseClean, baseWorking)
+	localRel := filepath.Join("config", "ai-agent.local.yaml")
+	localExisting := map[string]any{}
+	if _, statErr := os.Stat(localRel); statErr == nil {
+		m, err := configmerge.ReadYAMLFile(localRel)
+		if err != nil {
+			return fmt.Errorf("failed to parse existing %s during migration: %w", localRel, err)
+		}
+		if m != nil {
+			localExisting = m
+		}
+	} else if !os.IsNotExist(statErr) {
+		return fmt.Errorf("failed to stat %s: %w", localRel, statErr)
+	}
+	localNew := configmerge.DeepMerge(localExisting, patch)
+	if err := configmerge.WriteYAMLFileAtomic(localRel, localNew); err != nil {
+		return err
+	}
+	if _, err := runGitCmd("checkout", "--", baseRel); err != nil {
+		return fmt.Errorf("failed to reset %s to upstream: %w", baseRel, err)
+	}
+	printUpdateInfo("Moved local edits from %s into %s", baseRel, localRel)
+	return nil
+}
+
+func gitFileModified(path string) (bool, error) {
+	// Use status porcelain so we detect staged-only changes too.
+	out, err := runGitCmd("status", "--porcelain", "--", path)
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(out) != "", nil
+}
+
+func gitShowYAMLMap(ref string, relPath string) (map[string]any, error) {
+	out, err := runGitCmd("show", fmt.Sprintf("%s:%s", ref, filepath.ToSlash(relPath)))
+	if err != nil {
+		return nil, err
+	}
+	return configmerge.ParseYAML([]byte(out))
+}
+
+func gitFetchTags(remote string) error {
+	_, err := runGitCmd("fetch", "--tags", remote)
+	if err != nil {
+		return fmt.Errorf("git fetch --tags %s failed: %w", remote, err)
+	}
+	return nil
+}
+
+func gitMergeFastForward(remoteRef string) error {
+	_, err := runGitCmd("merge", "--ff-only", remoteRef)
+	if err != nil {
+		return fmt.Errorf("git merge --ff-only %s failed (branch likely diverged or local conflicts). Fix manually and retry: %w", remoteRef, err)
+	}
+	return nil
+}
+
+func gitCurrentBranch() (string, error) {
+	out, err := runGitCmd("rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil {
+		return "", fmt.Errorf("git rev-parse --abbrev-ref HEAD failed: %w", err)
+	}
+	return strings.TrimSpace(out), nil
+}
+
+func gitLocalBranchExists(branch string) (bool, error) {
+	branch = strings.TrimSpace(branch)
+	if branch == "" {
+		return false, errors.New("branch name is empty")
+	}
+
+	gitArgs := make([]string, 0, 6)
+	if gitSafeDirectory != "" {
+		gitArgs = append(gitArgs, "-c", "safe.directory="+gitSafeDirectory)
+	}
+	gitArgs = append(gitArgs, "show-ref", "--verify", "--quiet", "refs/heads/"+branch)
+
+	cmd := exec.Command("git", gitArgs...)
+	cmd.Stdin = nil
+	cmd.Stdout = io.Discard
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err == nil {
+		return true, nil
+	}
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		if exitErr.ExitCode() == 1 {
+			return false, nil
+		}
+	}
+	msg := strings.TrimSpace(stderr.String())
+	if msg != "" {
+		return false, fmt.Errorf("git show-ref failed: %s", msg)
+	}
+	return false, fmt.Errorf("git show-ref failed: %w", err)
+}
+
+func gitCheckout(branch string) error {
+	_, err := runGitCmd("checkout", branch)
+	if err != nil {
+		return fmt.Errorf("git checkout %s failed: %w", branch, err)
+	}
+	return nil
+}
+
+func gitCheckoutTrack(branch string, remoteRef string) error {
+	_, err := runGitCmd("checkout", "-b", branch, "--track", remoteRef)
+	if err != nil {
+		return fmt.Errorf("git checkout -b %s --track %s failed: %w", branch, remoteRef, err)
+	}
+	return nil
+}
+
+func gitDiffNames(oldSHA string, newSHA string) ([]string, error) {
+	out, err := runGitCmd("diff", "--name-only", oldSHA+".."+newSHA)
+	if err != nil {
+		return nil, fmt.Errorf("git diff failed: %w", err)
+	}
+	lines := []string{}
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	sort.Strings(lines)
+	return lines, nil
+}
+
+func decideDockerActions(ctx *updateContext) {
+	mode := rebuildMode(strings.ToLower(strings.TrimSpace(updateRebuild)))
+	if mode != rebuildAuto && mode != rebuildNone && mode != rebuildAll {
+		mode = rebuildAuto
+	}
+
+	for _, f := range ctx.changedFiles {
+		if strings.HasPrefix(f, "docker-compose") && (strings.HasSuffix(f, ".yml") || strings.HasSuffix(f, ".yaml")) {
+			ctx.composeChanged = true
+		}
+	}
+
+	if mode == rebuildNone {
+		// Conservative: restart ai_engine if code/config changed.
+		for _, f := range ctx.changedFiles {
+			if strings.HasPrefix(f, "src/") || f == "main.py" || strings.HasPrefix(f, "config/") || strings.HasPrefix(f, "scripts/") {
+				ctx.servicesToRestart["ai_engine"] = true
+			}
+		}
+		return
+	}
+
+	if mode == rebuildAll {
+		ctx.servicesToRebuild["ai_engine"] = true
+		ctx.servicesToRebuild["admin_ui"] = true
+		ctx.servicesToRebuild["local_ai_server"] = true
+		return
+	}
+
+	// auto
+	for _, f := range ctx.changedFiles {
+		switch {
+		case strings.HasPrefix(f, "admin_ui/"):
+			ctx.servicesToRebuild["admin_ui"] = true
+		case strings.HasPrefix(f, "local_ai_server/"):
+			ctx.servicesToRebuild["local_ai_server"] = true
+		case f == "Dockerfile" || f == "requirements.txt":
+			ctx.servicesToRebuild["ai_engine"] = true
+		case strings.HasPrefix(f, "src/") || f == "main.py" || strings.HasPrefix(f, "config/") || strings.HasPrefix(f, "scripts/"):
+			ctx.servicesToRestart["ai_engine"] = true
+		}
+	}
+
+	// If we rebuild, restart is implied.
+	for svc := range ctx.servicesToRebuild {
+		delete(ctx.servicesToRestart, svc)
+	}
+}
+
+func updateMayTouchAIEngine(ctx *updateContext) bool {
+	return ctx.composeChanged || ctx.servicesToRebuild["ai_engine"] || ctx.servicesToRestart["ai_engine"]
+}
+
+func updateHasDockerChanges(ctx *updateContext) bool {
+	return len(ctx.servicesToRebuild) > 0 || len(ctx.servicesToRestart) > 0 || ctx.composeChanged
+}
+
+func preflightDockerChangeGuard(ctx *updateContext) error {
+	if !updateHasDockerChanges(ctx) {
+		return nil
+	}
+	if _, err := runCmd("docker", "compose", "version"); err != nil {
+		return fmt.Errorf("docker compose is required before updating checkout because Docker changes are planned: %w", err)
+	}
+	if !updateMayTouchAIEngine(ctx) || envBool("AAVA_UPDATE_FORCE_ACTIVE_CALLS") {
+		return nil
+	}
+
+	activeCalls, reachable, err := queryActiveCalls()
+	if err == nil && reachable && activeCalls > 0 {
+		return fmt.Errorf("refusing to update checkout while %d active call(s) are in progress; retry after calls complete or set AAVA_UPDATE_FORCE_ACTIVE_CALLS=true", activeCalls)
+	}
+	if err != nil {
+		printUpdateInfo("WARN: unable to check active calls before updating checkout: %v", err)
+	}
+	return nil
+}
+
+func applyDockerActions(ctx *updateContext) error {
+	if len(ctx.servicesToRebuild) == 0 && len(ctx.servicesToRestart) == 0 && !ctx.composeChanged {
+		return nil
+	}
+
+	if _, err := runDockerCommandForUpdate("docker", "compose", "version"); err != nil {
+		return fmt.Errorf("docker compose is required but not available: %w", err)
+	}
+
+	// When compose files change, avoid doing an unscoped `docker compose up` because it can
+	// implicitly (re)create services the operator never started (e.g., local_ai_server) and
+	// fail if their images aren't present. Instead, scope to services that are already running
+	// plus any services we explicitly intend to rebuild/restart.
+	runningServices := map[string]bool{}
+	runningServicesKnown := false
+	out, err := runDockerCommandForUpdate("docker", "compose", "ps", "--services", "--status", "running")
+	if err != nil {
+		// Fallback for older compose versions (or environments where --status isn't supported).
+		out, err = runDockerCommandForUpdate("docker", "compose", "ps", "--services")
+	}
+	if err == nil {
+		runningServicesKnown = true
+		for _, line := range strings.Split(out, "\n") {
+			svc := strings.TrimSpace(line)
+			if svc != "" {
+				runningServices[svc] = true
+			}
+		}
+	}
+
+	rebuildServices := sortedKeys(ctx.servicesToRebuild)
+	restartServices := sortedKeys(ctx.servicesToRestart)
+	buildOnlyServices := []string{}
+	localAIExisting := ctx.localAIExisting
+	localAIExistingKnown := ctx.localAIExistingKnown
+	if containsString(rebuildServices, "local_ai_server") {
+		if existingServices, known := existingComposeServicesForUpdate(); known {
+			localAIExisting = existingServices["local_ai_server"]
+			localAIExistingKnown = true
+		}
+	}
+
+	// Avoid starting services that aren't already running unless explicitly targeted by rebuild/restart.
+	if !updateIncludeUI {
+		// If admin_ui is excluded, drop it even if a caller accidentally marked it.
+		rebuildServices = filterSlice(rebuildServices, func(s string) bool { return s != "admin_ui" })
+		restartServices = filterSlice(restartServices, func(s string) bool { return s != "admin_ui" })
+	}
+
+	// Don't rebuild services that the operator never started — auto-detection of changed files in
+	// e.g. local_ai_server/ should not force-start that service on deployments that don't use it.
+	if runningServicesKnown {
+		rebuildServices = filterSlice(rebuildServices, func(svc string) bool {
+			if svc != "local_ai_server" {
+				return runningServices[svc]
+			}
+			return runningServices[svc] || ctx.localAISelected || (localAIExistingKnown && localAIExisting)
+		})
+	} else {
+		// Without a trustworthy running-state snapshot, only an explicit active
+		// route selection may authorize `compose up` for Local AI. Existence alone
+		// cannot distinguish a running service from one intentionally left stopped.
+		rebuildServices = filterSlice(rebuildServices, func(svc string) bool {
+			return svc != "local_ai_server" || ctx.localAISelected
+		})
+	}
+
+	// Rebuild the image for an installed-but-stopped Local AI container without
+	// changing its runtime state. `docker compose up -d --build` would start it
+	// and, because the service uses restart: unless-stopped, leave it running
+	// after an otherwise routine update. A selected-but-not-yet-created Local AI
+	// service is not build-only: it must still be started below so the active
+	// route can work.
+	if runningServicesKnown && containsString(rebuildServices, "local_ai_server") &&
+		!runningServices["local_ai_server"] && localAIExistingKnown && localAIExisting {
+		buildOnlyServices = append(buildOnlyServices, "local_ai_server")
+		rebuildServices = filterSlice(rebuildServices, func(svc string) bool {
+			return svc != "local_ai_server"
+		})
+	}
+
+	// If a service isn't running, and we aren't rebuilding it, prefer to skip a plain restart
+	// attempt (restart would fail anyway).
+	if runningServicesKnown && len(restartServices) > 0 {
+		restartServices = filterSlice(restartServices, func(svc string) bool {
+			return runningServices[svc]
+		})
+	}
+
+	if runningServices["ai_engine"] && (ctx.composeChanged || containsString(rebuildServices, "ai_engine") || containsString(restartServices, "ai_engine")) && !envBool("AAVA_UPDATE_FORCE_ACTIVE_CALLS") {
+		activeCalls, reachable, err := queryActiveCalls()
+		if err == nil && reachable && activeCalls > 0 {
+			printUpdateInfo("WARN: %d active call(s) started after update checkout; continuing to keep code and containers aligned", activeCalls)
+		}
+		if err != nil {
+			printUpdateInfo("WARN: unable to check active calls before ai_engine restart: %v", err)
+		}
+	}
+
+	if ctx.composeChanged {
+		// Avoid implicit builds when Compose files change (some deployments use pull_policy: build).
+		// The rebuild/restart logic below will handle builds explicitly when needed.
+		args := []string{"compose", "up", "-d", "--remove-orphans", "--no-build"}
+		if updateForceRecreate {
+			args = append(args, "--force-recreate")
+		}
+
+		targets := map[string]bool{}
+		for svc := range runningServices {
+			targets[svc] = true
+		}
+		// Only include rebuild/restart targets that are already running in the --no-build step.
+		// Services not yet running will be started by the explicit --build step below, so including
+		// them here would cause a "no such image" failure for services the operator never built
+		// (e.g., local_ai_server on deployments that don't use Local AI).
+		for svc := range ctx.servicesToRebuild {
+			if runningServices[svc] {
+				targets[svc] = true
+			}
+		}
+		for svc := range ctx.servicesToRestart {
+			if runningServices[svc] {
+				targets[svc] = true
+			}
+		}
+
+		// If admin_ui updates are excluded, ensure we never recreate/restart it as part of the
+		// compose-changed `up` step.
+		if !updateIncludeUI {
+			delete(targets, "admin_ui")
+		}
+
+		// Only run compose-up if we have explicit targets; otherwise, don't implicitly start services.
+		if len(targets) > 0 {
+			args = append(args, sortedKeys(targets)...)
+			if _, err := runDockerCommandForUpdate("docker", args...); err != nil {
+				return fmt.Errorf("docker compose up (remove-orphans) failed: %w", err)
+			}
+		}
+	}
+
+	if len(buildOnlyServices) > 0 {
+		args := append([]string{"compose", "build"}, buildOnlyServices...)
+		if _, err := runDockerCommandForUpdate("docker", args...); err != nil {
+			return fmt.Errorf("docker compose build failed: %w", err)
+		}
+	}
+
+	if len(rebuildServices) > 0 {
+		args := []string{"compose", "up", "-d", "--build"}
+		if updateForceRecreate {
+			args = append(args, "--force-recreate")
+		}
+		args = append(args, rebuildServices...)
+		if _, err := runDockerCommandForUpdate("docker", args...); err != nil {
+			return fmt.Errorf("docker compose up --build failed: %w", err)
+		}
+	}
+
+	for _, svc := range restartServices {
+		if _, err := runDockerCommandForUpdate("docker", "compose", "restart", svc); err != nil {
+			// Fallback: start/recreate service if restart fails.
+			if _, err2 := runDockerCommandForUpdate("docker", "compose", "up", "-d", "--no-build", svc); err2 != nil {
+				return fmt.Errorf("failed to restart %s (restart error: %v; up error: %w)", svc, err, err2)
+			}
+		}
+	}
+
+	return nil
+}
+
+func containsString(items []string, needle string) bool {
+	for _, item := range items {
+		if item == needle {
+			return true
+		}
+	}
+	return false
+}
+
+func envBool(name string) bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(name)))
+	return v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
+func configuredHealthPort() int {
+	const defaultPort = 15000
+	if port, ok := parseHealthPort(os.Getenv("HEALTH_BIND_PORT")); ok {
+		return port
+	}
+	if raw, ok := dotenvValue(".env", "HEALTH_BIND_PORT"); ok {
+		if port, ok := parseHealthPort(raw); ok {
+			return port
+		}
+	}
+
+	cfg := map[string]any{}
+	if base, err := configmerge.ReadYAMLFile(filepath.Join("config", "ai-agent.yaml")); err == nil {
+		cfg = base
+	}
+	if local, err := configmerge.ReadYAMLFile(filepath.Join("config", "ai-agent.local.yaml")); err == nil {
+		cfg = configmerge.DeepMerge(cfg, local)
+	}
+	if health, ok := cfg["health"].(map[string]any); ok {
+		if port, ok := parseHealthPortValue(health["port"]); ok {
+			return port
+		}
+	}
+	return defaultPort
+}
+
+func parseHealthPortValue(raw any) (int, bool) {
+	switch v := raw.(type) {
+	case int:
+		return parseHealthPort(strconv.Itoa(v))
+	case int64:
+		return parseHealthPort(strconv.FormatInt(v, 10))
+	case float64:
+		if v == float64(int(v)) {
+			return parseHealthPort(strconv.Itoa(int(v)))
+		}
+	case string:
+		return parseHealthPort(v)
+	}
+	return 0, false
+}
+
+func parseHealthPort(raw string) (int, bool) {
+	p, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || p < 1 || p > 65535 {
+		return 0, false
+	}
+	return p, true
+}
+
+func dotenvValue(path, key string) (string, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 || strings.TrimSpace(parts[0]) != key {
+			continue
+		}
+		value := strings.TrimSpace(parts[1])
+		if len(value) >= 2 {
+			if (value[0] == '"' && value[len(value)-1] == '"') || (value[0] == '\'' && value[len(value)-1] == '\'') {
+				value = value[1 : len(value)-1]
+			}
+		}
+		return value, true
+	}
+	return "", false
+}
+
+func queryActiveCalls() (int, bool, error) {
+	port := configuredHealthPort()
+	script := fmt.Sprintf(`
+import json, urllib.request
+try:
+    with urllib.request.urlopen("http://127.0.0.1:%d/sessions/stats", timeout=3) as resp:
+        print(resp.read().decode("utf-8"))
+except Exception as e:
+    print(json.dumps({"_probe_error": str(e)}))
+`, port)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "docker", "exec", "ai_engine", "python3", "-c", script)
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return 0, false, fmt.Errorf("docker exec ai_engine sessions/stats timed out after 8s")
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("docker exec ai_engine sessions/stats failed: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(out), &payload); err != nil {
+		return 0, true, err
+	}
+	if probeErr, ok := payload["_probe_error"].(string); ok && strings.TrimSpace(probeErr) != "" {
+		return 0, false, errors.New(probeErr)
+	}
+	for _, key := range []string{"active_calls", "active_sessions"} {
+		if raw, ok := payload[key]; ok {
+			switch v := raw.(type) {
+			case float64:
+				return int(v), true, nil
+			case int:
+				return v, true, nil
+			}
+		}
+	}
+	return 0, true, nil
+}
+
+func filterSlice(in []string, keep func(string) bool) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(in))
+	for _, v := range in {
+		if keep(v) {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func runPostUpdateCheck() (report *check.Report, status string, warnCount int, failCount int, err error) {
+	runner := check.NewRunner(verbose, version, buildTime)
+	report, runErr := runner.Run()
+	if report == nil {
+		return nil, "FAIL", 0, 1, fmt.Errorf("agent check failed: %w", runErr)
+	}
+	warnCount = report.WarnCount
+	failCount = report.FailCount
+	if runErr != nil || failCount > 0 {
+		return report, "FAIL", warnCount, failCount, runErr
+	}
+	if warnCount > 0 {
+		return report, "WARN", warnCount, 0, nil
+	}
+	return report, "PASS", 0, 0, nil
+}
+
+func reportHasTransientStartupWarning(report *check.Report) bool {
+	if report == nil {
+		return false
+	}
+	for _, item := range report.Items {
+		if item.Name == "ARI" && item.Status == check.StatusWarn && item.Message == "reachable but app not registered" {
+			return true
+		}
+	}
+	return false
+}
+
+func runPostUpdateCheckWithRetry(timeout time.Duration, interval time.Duration) (report *check.Report, status string, warnCount int, failCount int, err error) {
+	deadline := time.Now().Add(timeout)
+	var lastReport *check.Report
+	var lastStatus string
+	var lastWarn int
+	var lastFail int
+	var lastErr error
+	attempt := 0
+
+	for {
+		attempt++
+		report, status, warnCount, failCount, err = runPostUpdateCheck()
+		transientStartupWarning := attempt == 1 && err == nil && failCount == 0 && reportHasTransientStartupWarning(report)
+		if err == nil && failCount == 0 && !transientStartupWarning {
+			if attempt > 1 {
+				printUpdateInfo("agent check passed after retry %d", attempt-1)
+			}
+			return report, status, warnCount, failCount, err
+		}
+
+		lastReport, lastStatus, lastWarn, lastFail, lastErr = report, status, warnCount, failCount, err
+		if time.Now().Add(interval).After(deadline) {
+			return lastReport, lastStatus, lastWarn, lastFail, lastErr
+		}
+		if transientStartupWarning {
+			printUpdateInfo("ARI is reachable but the app is not registered yet; retrying once after services settle")
+		} else if attempt == 1 {
+			printUpdateInfo("agent check failed; retrying for up to %s while services settle", timeout.String())
+		}
+		time.Sleep(interval)
+	}
+}
+
+func printUpdateFailureRecovery(ctx *updateContext, err error) {
+	fmt.Printf("\n==> Update failed\n")
+	printUpdateInfo("Error: %v", err)
+
+	if ctx == nil {
+		return
+	}
+
+	if ctx.backupDir != "" {
+		printUpdateInfo("Backups: %s", ctx.backupDir)
+		fmt.Println("Recovery (restore operator-owned config):")
+		fmt.Printf("  cp %s .env\n", filepath.Join(ctx.backupDir, ".env"))
+		fmt.Printf("  cp %s %s\n", filepath.Join(ctx.backupDir, "config", "ai-agent.yaml"), filepath.Join("config", "ai-agent.yaml"))
+		fmt.Printf("  cp %s %s  # if exists\n", filepath.Join(ctx.backupDir, "config", "ai-agent.local.yaml"), filepath.Join("config", "ai-agent.local.yaml"))
+		fmt.Printf("  cp %s %s\n", filepath.Join(ctx.backupDir, "config", "users.json"), filepath.Join("config", "users.json"))
+		fmt.Println("  # Replace contexts directory (if needed):")
+		fmt.Printf("  rm -rf %s && cp -r %s %s\n",
+			filepath.Join("config", "contexts"),
+			filepath.Join(ctx.backupDir, "config", "contexts"),
+			filepath.Join("config", "contexts"),
+		)
+	}
+
+	if ctx.stashed {
+		fmt.Println("Recovery (git stash):")
+		fmt.Println("  git stash list")
+		fmt.Println("  git stash pop   # may conflict; resolve if needed")
+	}
+
+	if ctx.repoRoot != "" {
+		fmt.Println("If git reports 'dubious ownership':")
+		fmt.Printf("  git config --global --add safe.directory %s\n", ctx.repoRoot)
+	}
+}
+
+func printUpdateSummary(ctx *updateContext, checkStatus string, warnCount int, failCount int) {
+	if strings.TrimSpace(ctx.oldSHA) == strings.TrimSpace(ctx.newSHA) {
+		fmt.Printf("Up to date: %s\n", shortSHA(ctx.oldSHA))
+	} else {
+		fmt.Printf("Updated: %s -> %s\n", shortSHA(ctx.oldSHA), shortSHA(ctx.newSHA))
+	}
+	if ctx.backupDir != "" {
+		fmt.Printf("Backups: %s\n", ctx.backupDir)
+	}
+	if ctx.stashed {
+		if ctx.stashRef != "" {
+			fmt.Printf("Stash: %s\n", ctx.stashRef)
+		} else {
+			fmt.Printf("Stash: created\n")
+		}
+	}
+	if len(ctx.servicesToRebuild) > 0 {
+		fmt.Printf("Rebuilt: %s\n", strings.Join(sortedKeys(ctx.servicesToRebuild), ", "))
+	}
+	if len(ctx.servicesToRestart) > 0 {
+		fmt.Printf("Restarted: %s\n", strings.Join(sortedKeys(ctx.servicesToRestart), ", "))
+	}
+	if ctx.composeChanged {
+		fmt.Printf("Compose: applied changes\n")
+	}
+	if checkStatus != "" {
+		fmt.Printf("Check: %s (warn=%d fail=%d)\n", checkStatus, warnCount, failCount)
+	}
+}
+
+func updateHumanWriter() io.Writer {
+	// When emitting machine-readable JSON plans, keep human output on stderr so stdout stays valid JSON.
+	if updatePlan && updatePlanJSON {
+		return os.Stderr
+	}
+	return os.Stdout
+}
+
+func printUpdateStep(title string) {
+	fmt.Fprintf(updateHumanWriter(), "\n==> %s\n", title)
+}
+
+func printUpdateInfo(format string, args ...any) {
+	fmt.Fprintf(updateHumanWriter(), " - "+format+"\n", args...)
+}
+
+func printDockerActionsPlanned(ctx *updateContext) {
+	if len(ctx.servicesToRebuild) == 0 && len(ctx.servicesToRestart) == 0 && !ctx.composeChanged {
+		printUpdateInfo("No container rebuild/restart required")
+		return
+	}
+	if ctx.composeChanged {
+		printUpdateInfo("Compose files changed (will run docker compose up --no-build --remove-orphans)")
+	}
+	if len(ctx.servicesToRebuild) > 0 {
+		printUpdateInfo("Will rebuild: %s", strings.Join(sortedKeys(ctx.servicesToRebuild), ", "))
+	}
+	if len(ctx.servicesToRestart) > 0 {
+		printUpdateInfo("Will restart: %s", strings.Join(sortedKeys(ctx.servicesToRestart), ", "))
+	}
+}
+
+func printPostUpdateCheck(report *check.Report, warnCount int, failCount int) {
+	if report == nil {
+		return
+	}
+	if verbose || warnCount > 0 || failCount > 0 {
+		report.OutputText(os.Stdout)
+	}
+}
+
+func sortedKeys(m map[string]bool) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func shortSHA(sha string) string {
+	sha = strings.TrimSpace(sha)
+	if len(sha) > 8 {
+		return sha[:8]
+	}
+	return sha
+}
+
+func runCmd(name string, args ...string) (string, error) {
+	cmd := exec.Command(name, args...)
+	cmd.Stdin = os.Stdin
+	if verbose {
+		fmt.Printf(" → %s %s\n", name, strings.Join(args, " "))
+		var buf bytes.Buffer
+		cmd.Stdout = io.MultiWriter(os.Stdout, &buf)
+		cmd.Stderr = io.MultiWriter(os.Stderr, &buf)
+		err := cmd.Run()
+		text := strings.TrimSpace(buf.String())
+		if err != nil {
+			if text != "" {
+				return text, fmt.Errorf("%w", err)
+			}
+			return text, err
+		}
+		return text, nil
+	}
+
+	out, err := cmd.CombinedOutput()
+	text := strings.TrimSpace(string(out))
+	if err != nil {
+		if text != "" {
+			return text, fmt.Errorf("%w: %s", err, text)
+		}
+		return text, err
+	}
+	return text, nil
+}
+
+func runGitCmd(args ...string) (string, error) {
+	gitArgs := make([]string, 0, len(args)+2)
+	if gitSafeDirectory != "" {
+		gitArgs = append(gitArgs, "-c", "safe.directory="+gitSafeDirectory)
+	}
+	gitArgs = append(gitArgs, args...)
+	return runCmd("git", gitArgs...)
+}
+
+func gitIsAncestor(ancestor string, descendant string) (bool, error) {
+	gitArgs := make([]string, 0, 6)
+	if gitSafeDirectory != "" {
+		gitArgs = append(gitArgs, "-c", "safe.directory="+gitSafeDirectory)
+	}
+	gitArgs = append(gitArgs, "merge-base", "--is-ancestor", ancestor, descendant)
+
+	cmd := exec.Command("git", gitArgs...)
+	cmd.Stdin = nil
+	cmd.Stdout = io.Discard
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if err == nil {
+		return true, nil
+	}
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		// Exit status 1 means "not an ancestor" for --is-ancestor.
+		if exitErr.ExitCode() == 1 {
+			return false, nil
+		}
+	}
+	msg := strings.TrimSpace(stderr.String())
+	if msg != "" {
+		return false, fmt.Errorf("git merge-base --is-ancestor failed: %s", msg)
+	}
+	return false, fmt.Errorf("git merge-base --is-ancestor failed: %w", err)
+}
+
+func findGitRootFromCWD() (string, error) {
+	start, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	dir := start
+	for {
+		if hasGitDir(dir) {
+			if abs, err := filepath.Abs(dir); err == nil {
+				return abs, nil
+			}
+			return dir, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return "", errors.New("no .git directory found in parent chain")
+}
+
+func hasGitDir(dir string) bool {
+	info, err := os.Stat(filepath.Join(dir, ".git"))
+	if err != nil {
+		return false
+	}
+	// `.git` can be a directory or a file (worktrees/submodules); both indicate a git root.
+	return info.IsDir() || info.Mode().IsRegular()
+}
+
+func bestEffortCWD() string {
+	if wd, err := os.Getwd(); err == nil && wd != "" {
+		return wd
+	}
+	return "<repo-path>"
+}

@@ -1,0 +1,25 @@
+.PHONY: help dev-test lint fmt docker-up docker-down
+
+help:
+	@echo "IDE helper targets:"
+	@echo "  make -f tools/ide/Makefile.ide dev-test"
+	@echo "  make -f tools/ide/Makefile.ide lint"
+	@echo "  make -f tools/ide/Makefile.ide fmt"
+	@echo "  make -f tools/ide/Makefile.ide docker-up"
+	@echo "  make -f tools/ide/Makefile.ide docker-down"
+
+dev-test:
+	pytest -q
+
+lint:
+	ruff check .
+
+fmt:
+	ruff format .
+	yapf -ir src tests
+
+docker-up:
+	docker compose up -d
+
+docker-down:
+	docker compose down

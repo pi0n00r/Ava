@@ -1,0 +1,17 @@
+# Prevent local node_modules from overwriting Docker-installed dependencies
+# This fixes "vite: not found" errors during docker build
+frontend/node_modules/
+node_modules/
+
+# Other dev artifacts
+.git/
+*.log
+.env
+.env.*
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+htmlcov/
+*.md
+!README.md

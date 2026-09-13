@@ -1,0 +1,308 @@
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+import settings
+from dotenv import load_dotenv
+import os
+import logging
+import secrets
+from pathlib import Path
+import shutil
+
+
+def _ensure_outbound_prompt_assets() -> None:
+    """
+    Install shipped outbound prompt assets into the runtime media directory.
+
+    This keeps "out of the box" campaigns functional without requiring the user to upload
+    consent/voicemail recordings before first use.
+    """
+    try:
+        project_root = (os.getenv("PROJECT_ROOT") or "/app/project").strip() or "/app/project"
+        src_dir = Path(project_root) / "assets" / "outbound_prompts" / "en-US"
+        if not src_dir.exists():
+            return
+
+        media_dir = Path(os.getenv("AAVA_MEDIA_DIR") or "/mnt/asterisk_media/ai-generated")
+        try:
+            media_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        mapping = {
+            "aava-consent-default.ulaw": "aava-consent-default.ulaw",
+            "aava-voicemail-default.ulaw": "aava-voicemail-default.ulaw",
+        }
+        for src_name, dst_name in mapping.items():
+            src = src_dir / src_name
+            dst = media_dir / dst_name
+            if not src.exists():
+                continue
+            if dst.exists() and dst.stat().st_size == src.stat().st_size:
+                continue
+            try:
+                data = src.read_bytes()
+                dst.write_bytes(data)
+            except Exception:
+                continue
+    except Exception:
+        # Never block Admin UI startup for this.
+        pass
+
+# Load environment variables (wizard will create .env from .env.example on first Next click)
+load_dotenv(settings.ENV_PATH)
+
+# NOTE: DB permission alignment is handled by install/preflight steps (host-side),
+# keeping runtime code minimal and CI security scanners happy.
+_ensure_outbound_prompt_assets()
+
+def _cleanup_orphaned_model_downloads() -> None:
+    """
+    Clean up orphaned .part files and .extract_* directories in the local AI models directory
+    that may have been left behind by interrupted downloads/extractions.
+    """
+    try:
+        models_dir = Path(os.getenv("AAVA_MODELS_DIR") or "/mnt/asterisk_models")
+        if not models_dir.exists():
+            return
+        
+        cleaned_up = 0
+        
+        # Clean up files matching *.part
+        for part_file in models_dir.rglob("*.part"):
+            try:
+                if part_file.is_file():
+                    part_file.unlink()
+                    cleaned_up += 1
+            except Exception:
+                pass
+                
+        # Clean up directories matching .extract_*
+        for root, dirs, files in os.walk(models_dir):
+            for d in list(dirs):  # Use list to safely modify while iterating
+                if d.startswith(".extract_"):
+                    extract_path = Path(root) / d
+                    try:
+                        shutil.rmtree(extract_path)
+                        cleaned_up += 1
+                        dirs.remove(d) # Remove to prevent os.walk from entering it
+                    except Exception:
+                        pass
+        
+        if cleaned_up > 0:
+            logging.getLogger(__name__).info("Cleaned up %d orphaned model download temp file(s)/dir(s).", cleaned_up)
+            
+    except Exception as e:
+        logging.getLogger(__name__).warning("Failed to clean up orphaned model downloads: %s", e)
+
+_cleanup_orphaned_model_downloads()
+
+# SECURITY: Admin UI binds to 0.0.0.0 by default (DX-first).
+# If JWT_SECRET is missing/placeholder, generate an ephemeral secret so tokens
+# aren't signed with a known insecure key. Scripts (preflight/install) should
+# persist a strong JWT_SECRET into .env for stable restarts.
+_uvicorn_host = os.getenv("UVICORN_HOST", "0.0.0.0")
+_is_remote_bind = _uvicorn_host not in ("127.0.0.1", "localhost", "::1")
+_placeholder_secrets = {"", "change-me-please", "changeme"}
+_raw_jwt_secret = (os.getenv("JWT_SECRET", "") or "").strip()
+
+if _is_remote_bind and _raw_jwt_secret in _placeholder_secrets:
+    os.environ["JWT_SECRET"] = secrets.token_hex(32)
+    logging.getLogger(__name__).warning(
+        "JWT_SECRET is missing/placeholder while Admin UI is remote-accessible on %s. "
+        "Generated an ephemeral JWT_SECRET for this process. For production, set a strong "
+        "JWT_SECRET in .env and restrict port 3003 (firewall/VPN/reverse proxy).",
+        _uvicorn_host,
+    )
+
+from api import config, system, live_status, wizard, logs, local_ai, ollama, mcp, calls, outbound, vicidial, tools, docs, custom_models, agents, support  # noqa: E402
+import auth  # noqa: E402
+from agents_store import AgentsStore  # noqa: E402
+
+# Allow disabling API docs in production for security hardening
+_enable_api_docs = os.getenv("ENABLE_API_DOCS", "true").lower() in ("1", "true", "yes")
+
+app = FastAPI(
+    title="Asterisk AI Voice Agent Admin API",
+    description="""
+REST API for managing the Asterisk AI Voice Agent system.
+
+## Authentication
+Most endpoints require JWT authentication. Obtain a token via `POST /api/auth/login`.
+
+## API Groups
+
+| Group | Description |
+|-------|-------------|
+| **auth** | Login, password management, user info |
+| **config** | YAML configuration, environment variables, provider settings |
+| **system** | Container management, health checks, updates, ARI testing |
+| **wizard** | Setup wizard, local AI model management |
+| **local-ai** | Local AI server model switching, backends, capabilities |
+| **calls** | Call history, transcripts, statistics, export |
+| **outbound** | Campaign management, leads, recordings |
+| **tools** | Tool catalog, HTTP tool testing, email templates |
+| **logs** | Container logs and structured log events |
+| **mcp** | MCP server status and testing (proxied from AI Engine) |
+| **ollama** | Ollama connection testing and model listing |
+| **documentation** | In-app documentation browser |
+
+## Related Services
+
+| Service | Endpoints |
+|---------|-----------|
+| **AI Engine Health Server** (port 15000) | `/health`, `/metrics`, `/live`, `/ready`, `/reload` |
+""",
+    version="7.5.4",
+    docs_url="/docs" if _enable_api_docs else None,
+    redoc_url="/redoc" if _enable_api_docs else None,
+    openapi_url="/openapi.json" if _enable_api_docs else None,
+    openapi_tags=[
+        {"name": "auth", "description": "Authentication and user management"},
+        {"name": "config", "description": "Configuration management (YAML, .env, providers)"},
+        {"name": "system", "description": "System operations, containers, updates, health"},
+        {"name": "wizard", "description": "Setup wizard and local AI model downloads"},
+        {"name": "local-ai", "description": "Local AI server management"},
+        {"name": "agents", "description": "Agents (v7) — CRUD, per-agent stats, dialplan snippets, templates, and YAML→DB migration status"},
+        {"name": "calls", "description": "Call history and analytics"},
+        {"name": "outbound", "description": "Outbound campaigns and lead management"},
+        {"name": "tools", "description": "Tool catalog, HTTP tool testing, and managed HTTP/webhook tool CRUD"},
+        {"name": "logs", "description": "Container logs and events"},
+        {"name": "mcp", "description": "MCP server status (proxied from AI Engine)"},
+        {"name": "ollama", "description": "Ollama integration testing"},
+        {"name": "documentation", "description": "In-app documentation browser"},
+        {"name": "custom-models", "description": "Community-contributed model entries (off by default)"},
+    ],
+)
+
+# Initialize users — generate a random one-time password on first run.
+_first_run_pw = auth.ensure_default_user()
+if _first_run_pw:
+    _log = logging.getLogger(__name__)
+    _log.warning("=" * 60)
+    _log.warning("ONE-TIME ADMIN PASSWORD (username: admin) — change at first login")
+    _log.warning("Password: %s", _first_run_pw)
+    _log.warning(
+        "Also saved to root-only file: %s", auth.FIRST_RUN_PASSWORD_PATH
+    )
+    _log.warning(
+        "If these logs are rotated/forwarded away, read the file above (host: ./config/.first-run-password)."
+    )
+    _log.warning("=" * 60)
+
+# Warn if JWT_SECRET isn't set (localhost-only is okay for dev)
+if getattr(auth, "USING_PLACEHOLDER_SECRET", False):
+    logging.getLogger(__name__).warning(
+        "JWT_SECRET is missing/placeholder; Admin UI is using an insecure secret. "
+        "Set JWT_SECRET in .env for production (recommended: openssl rand -hex 32)."
+    )
+
+# The engine owns the one-time, atomic legacy Context import in v7.4.0. Keeping
+# Context import out of Admin UI startup avoids a race where two services import
+# the same empty store with different validation and promotion semantics. For an
+# existing store only, run the additive schema initializer and the explicit,
+# one-time legacy resource-policy promotion before the first authenticated API
+# visit. Ordinary API store construction never scans or mutates Agent rows, and
+# Agent CRUD returns 409 while legacy Contexts exist but the store is still empty.
+app.state.agents_migration_result = None
+_existing_agents_db = os.path.abspath(
+    os.getenv("AGENTS_DB_PATH", "/app/data/operator/agents.db")
+)
+if os.path.exists(_existing_agents_db):
+    try:
+        _schema_store = AgentsStore(db_path=_existing_agents_db)
+        _resource_rows_upgraded = _schema_store.upgrade_legacy_resource_policies()
+        _schema_store.close()
+        logging.getLogger(__name__).info(
+            "Existing Agent store schema is current: %s (resource policies upgraded: %s)",
+            _existing_agents_db,
+            _resource_rows_upgraded,
+        )
+    except Exception as _schema_error:
+        logging.getLogger(__name__).error(
+            "Existing Agent store schema upgrade failed: %s", _schema_error
+        )
+
+# Configure CORS
+def _parse_cors_origins() -> list[str]:
+    raw = (settings.get_setting("ADMIN_UI_CORS_ORIGINS", "") or "").strip()
+    if not raw:
+        # Safe-ish local defaults.
+        return ["http://localhost:3003", "http://127.0.0.1:3003"]
+    if raw == "*":
+        return ["*"]
+    # Comma-separated list
+    return [o.strip() for o in raw.split(",") if o.strip()]
+
+
+cors_origins = _parse_cors_origins()
+cors_allow_credentials = "*" not in cors_origins
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=cors_allow_credentials,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Include routers
+# Public routes
+app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
+
+# Protected routes
+app.include_router(config.router, prefix="/api/config", tags=["config"], dependencies=[Depends(auth.get_current_user)])
+app.include_router(system.router, prefix="/api/system", tags=["system"], dependencies=[Depends(auth.get_current_user)])
+app.include_router(live_status.publish_router, prefix="/api/system", tags=["system"])
+app.include_router(live_status.router, prefix="/api/system", tags=["system"], dependencies=[Depends(auth.get_current_user)])
+app.include_router(wizard.router, prefix="/api/wizard", tags=["wizard"], dependencies=[Depends(auth.get_current_user)])
+app.include_router(logs.router, prefix="/api/logs", tags=["logs"], dependencies=[Depends(auth.get_current_user)])
+app.include_router(local_ai.router, prefix="/api/local-ai", tags=["local-ai"], dependencies=[Depends(auth.get_current_user)])
+app.include_router(mcp.router, dependencies=[Depends(auth.get_current_user)])
+app.include_router(ollama.router, tags=["ollama"], dependencies=[Depends(auth.get_current_user)])
+app.include_router(calls.router, prefix="/api", tags=["calls"], dependencies=[Depends(auth.get_current_user)])
+app.include_router(outbound.router, prefix="/api", tags=["outbound"], dependencies=[Depends(auth.get_current_user)])
+app.include_router(vicidial.router, prefix="/api", tags=["outbound"], dependencies=[Depends(auth.get_current_user)])
+app.include_router(tools.router, prefix="/api/tools", tags=["tools"], dependencies=[Depends(auth.get_current_user)])
+app.include_router(docs.router, tags=["documentation"], dependencies=[Depends(auth.get_current_user)])
+app.include_router(custom_models.router, prefix="/api/custom-models", tags=["custom-models"], dependencies=[Depends(auth.get_current_user)])
+app.include_router(agents.router, prefix="/api", tags=["agents"], dependencies=[Depends(auth.get_current_user)])
+app.include_router(support.router, prefix="/api", tags=["support"], dependencies=[Depends(auth.get_current_user)])
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
+
+# Serve static files (Frontend)
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+import os
+
+# Mount static files if directory exists (production/docker)
+static_dir = os.path.join(os.path.dirname(__file__), "static")
+if os.path.exists(static_dir):
+    static_files = StaticFiles(directory=static_dir, html=False)
+    app.mount("/assets", StaticFiles(directory=os.path.join(static_dir, "assets")), name="assets")
+    index_file = os.path.join(static_dir, "index.html")
+    
+    @app.get("/{full_path:path}")
+    async def serve_react_app(full_path: str):
+        # API routes are already handled above
+        if full_path.startswith("api/") or full_path in ("docs", "redoc", "openapi.json"):
+            raise HTTPException(status_code=404, detail="Not found")
+            
+        # Use Starlette's safe static path lookup to prevent traversal.
+        if full_path:
+            resolved_path, stat_result = static_files.lookup_path(full_path.lstrip("/"))
+            if stat_result and os.path.isfile(resolved_path):
+                return FileResponse(resolved_path)
+            
+        # Serve index.html for all other routes (SPA)
+        response = FileResponse(index_file)
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

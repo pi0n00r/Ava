@@ -1,0 +1,466 @@
+import asyncio
+import base64
+import json
+import wave
+from io import BytesIO
+from unittest.mock import MagicMock
+
+import pytest
+
+from src.audio.resampler import convert_pcm16le_to_target_format
+from src.config import AppConfig, OpenAIProviderConfig
+from src.pipelines.openai import OpenAISTTAdapter, OpenAILLMAdapter, OpenAITTSAdapter
+from src.pipelines.orchestrator import PipelineOrchestrator
+from src.tools.base import ToolPhase
+
+
+def _build_app_config() -> AppConfig:
+    providers = {
+        "openai": {
+            "api_key": "test-key",
+            "organization": "test-org",
+            "project": "test-project",
+            "realtime_base_url": "wss://api.openai.com/v1/realtime",
+            "chat_base_url": "https://api.openai.com/v1",
+            "tts_base_url": "https://api.openai.com/v1/audio/speech",
+            "realtime_model": "gpt-realtime",
+            "chat_model": "gpt-4o-mini",
+            "tts_model": "gpt-4o-mini-tts",
+            "voice": "alloy",
+            "default_modalities": ["text"],
+            "input_encoding": "linear16",
+            "input_sample_rate_hz": 8000,
+            "target_encoding": "mulaw",
+            "target_sample_rate_hz": 8000,
+            "chunk_size_ms": 20,
+            "response_timeout_sec": 2.0,
+        }
+    }
+    pipelines = {
+        "openai_stack": {
+            "stt": "openai_stt",
+            "llm": "openai_llm",
+            "tts": "openai_tts",
+            "options": {
+                "stt": {},
+                "llm": {"use_realtime": False, "temperature": 0.5},
+                "tts": {"format": {"encoding": "mulaw", "sample_rate": 8000}},
+            },
+        }
+    }
+    return AppConfig(
+        default_provider="openai",
+        providers=providers,
+        asterisk={"host": "127.0.0.1", "username": "ari", "password": "secret"},
+        llm={"initial_greeting": "hi", "prompt": "prompt", "model": "gpt-4o"},
+        audio_transport="audiosocket",
+        downstream_mode="stream",
+        pipelines=pipelines,
+        active_pipeline="openai_stack",
+    )
+
+
+class _MockWebSocket:
+    def __init__(self):
+        self.sent = []
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self.closed = False
+
+    async def send(self, data):
+        self.sent.append(data)
+
+    async def recv(self):
+        return await self._queue.get()
+
+    async def close(self):
+        self.closed = True
+
+    def push(self, message):
+        self._queue.put_nowait(message)
+
+
+class _FakeResponse:
+    def __init__(self, body: bytes, status: int = 200):
+        self._body = body
+        self.status = status
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def read(self):
+        return self._body
+
+    async def text(self):
+        return self._body.decode("utf-8", errors="ignore")
+
+
+class _FakeSession:
+    def __init__(self, body: bytes, status: int = 200):
+        self._body = body
+        self._status = status
+        self.requests = []
+        self.closed = False
+
+    def post(self, url, json=None, data=None, headers=None, timeout=None):
+        self.requests.append({"url": url, "json": json, "data": data, "headers": headers, "timeout": timeout})
+        return _FakeResponse(self._body, status=self._status)
+
+    async def close(self):
+        self.closed = True
+
+
+class _TimeoutStream:
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise asyncio.TimeoutError("simulated first-token timeout")
+
+
+class _FakeStreamingResponse(_FakeResponse):
+    def __init__(self, content, status: int = 200):
+        super().__init__(b"", status=status)
+        self.content = content
+
+
+class _FakeStreamingSession(_FakeSession):
+    def __init__(self, content, status: int = 200):
+        super().__init__(b"", status=status)
+        self._content = content
+
+    def post(self, url, json=None, data=None, headers=None, timeout=None):
+        self.requests.append({"url": url, "json": json, "data": data, "headers": headers, "timeout": timeout})
+        return _FakeStreamingResponse(self._content, status=self._status)
+
+
+@pytest.mark.asyncio
+async def test_openai_stt_adapter_transcribes(monkeypatch):
+    app_config = _build_app_config()
+    provider_config = OpenAIProviderConfig(**app_config.providers["openai"])
+    body = json.dumps({"text": "hello"}).encode("utf-8")
+    fake_session = _FakeSession(body)
+    adapter = OpenAISTTAdapter(
+        "openai_stt",
+        app_config,
+        provider_config,
+        {},
+        session_factory=lambda: fake_session,
+    )
+
+    await adapter.start()
+    await adapter.open_call("call-1", {})
+
+    audio_buffer = b"\x00\x10" * 160  # 10 ms @ 16 kHz
+    transcript = await adapter.transcribe("call-1", audio_buffer, 16000, {})
+    assert transcript == "hello"
+    request = fake_session.requests[0]
+    assert request["url"].endswith("/audio/transcriptions")
+    assert request["headers"]["Authorization"] == "Bearer test-key"
+    assert request["data"] is not None
+
+
+@pytest.mark.asyncio
+async def test_openai_llm_adapter_chat_completion(monkeypatch):
+    app_config = _build_app_config()
+    provider_config = OpenAIProviderConfig(**app_config.providers["openai"])
+    body = json.dumps({"choices": [{"message": {"content": "hi there"}}]}).encode("utf-8")
+    fake_session = _FakeSession(body)
+
+    adapter = OpenAILLMAdapter(
+        "openai_llm",
+        app_config,
+        provider_config,
+        {"use_realtime": False},
+        session_factory=lambda: fake_session,
+    )
+
+    await adapter.start()
+    response = await adapter.generate("call-1", "hello", {"system_prompt": "You are helpful."}, {})
+    assert response.text == "hi there"
+
+    request = fake_session.requests[0]
+    assert request["json"]["model"] == "gpt-4o-mini"
+    assert request["json"]["messages"][-1] == {"role": "user", "content": "hello"}
+
+
+def _bind_realistic_tool(adapter):
+    schema = {
+        "type": "function",
+        "function": {
+            "name": "blind_transfer",
+            "description": "Transfer through an authoritative configured destination",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "destination": {"type": "string", "enum": ["jd", "operator"]}
+                },
+                "required": ["destination"],
+            },
+        },
+    }
+    definition = MagicMock()
+    definition.phase = ToolPhase.IN_CALL
+    definition.to_openai_schema.return_value = schema
+    registry = MagicMock()
+    registry.get.return_value = MagicMock(definition=definition)
+    adapter.bind_tool_registry(registry)
+    return schema
+
+
+def _extra_body_with_reserved_collisions():
+    return {
+        "reasoning_effort": "none", "keep_alive": -1,
+        "model": "replacement", "messages": [], "tools": [{"unsafe": True}],
+        "tool_choice": "required", "stream": False, "temperature": 99,
+        "max_tokens": 999, "functions": [{"unsafe": True}],
+        "function_call": "unsafe", "parallel_tool_calls": True, "n": 99,
+    }
+
+
+@pytest.mark.asyncio
+async def test_openai_llm_adapter_extra_body_preserves_owned_fields_and_tools():
+    app_config = _build_app_config()
+    provider_config = OpenAIProviderConfig(**app_config.providers["openai"])
+    body = json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8")
+    fake_session = _FakeSession(body)
+    adapter = OpenAILLMAdapter(
+        "openai_llm",
+        app_config,
+        provider_config,
+        {
+            "temperature": 0.25, "max_tokens": 80, "tools": ["blind_transfer"],
+            "extra_body": _extra_body_with_reserved_collisions(),
+        },
+        session_factory=lambda: fake_session,
+    )
+    schema = _bind_realistic_tool(adapter)
+
+    await adapter.start()
+    await adapter.generate("call-1", "hello", {}, {})
+
+    payload = fake_session.requests[0]["json"]
+    assert payload["reasoning_effort"] == "none"
+    assert payload["keep_alive"] == -1
+    assert payload["model"] == "gpt-4o-mini"
+    assert payload["messages"][-1] == {"role": "user", "content": "hello"}
+    assert payload["tools"] == [schema]
+    assert payload["tool_choice"] == "auto"
+    assert "stream" not in payload
+    assert payload["temperature"] == 0.25
+    assert payload["max_tokens"] == 80
+    for key in ("functions", "function_call", "parallel_tool_calls", "n"):
+        assert key not in payload
+
+
+@pytest.mark.asyncio
+async def test_openai_llm_stream_extra_body_preserves_stream_and_real_tools():
+    app_config = _build_app_config()
+    provider_config = OpenAIProviderConfig(**app_config.providers["openai"])
+    fake_session = _FakeStreamingSession(_TimeoutStream())
+    adapter = OpenAILLMAdapter(
+        "openai_llm", app_config, provider_config,
+        {
+            "temperature": 0.25, "max_tokens": 80, "tools": ["blind_transfer"],
+            "extra_body": _extra_body_with_reserved_collisions(),
+        },
+        session_factory=lambda: fake_session,
+    )
+    schema = _bind_realistic_tool(adapter)
+
+    await adapter.start()
+    chunks = [chunk async for chunk in adapter.generate_stream("call-1", "hello", {}, {})]
+
+    assert chunks == []
+    payload = fake_session.requests[0]["json"]
+    assert payload["reasoning_effort"] == "none"
+    assert payload["keep_alive"] == -1
+    assert payload["model"] == "gpt-4o-mini"
+    assert payload["messages"][-1] == {"role": "user", "content": "hello"}
+    assert payload["tools"] == [schema]
+    assert payload["tool_choice"] == "auto"
+    assert payload["stream"] is True
+    assert payload["temperature"] == 0.25
+    assert payload["max_tokens"] == 80
+    for key in ("functions", "function_call", "parallel_tool_calls", "n"):
+        assert key not in payload
+
+
+@pytest.mark.asyncio
+async def test_openai_llm_adapter_without_extra_body_is_unchanged(monkeypatch):
+    app_config = _build_app_config()
+    provider_config = OpenAIProviderConfig(**app_config.providers["openai"])
+    body = json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8")
+    fake_session = _FakeSession(body)
+    adapter = OpenAILLMAdapter(
+        "openai_llm",
+        app_config,
+        provider_config,
+        {},
+        session_factory=lambda: fake_session,
+    )
+
+    await adapter.start()
+    await adapter.generate("call-1", "hello", {}, {})
+
+    assert fake_session.requests[0]["json"] == {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": "prompt"},
+            {"role": "user", "content": "hello"},
+        ],
+        "temperature": 0.7,
+    }
+
+
+@pytest.mark.asyncio
+async def test_openai_llm_uses_captured_registry_for_tool_schemas(monkeypatch):
+    app_config = _build_app_config()
+    provider_config = OpenAIProviderConfig(**app_config.providers["openai"])
+    body = json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8")
+    fake_session = _FakeSession(body)
+    adapter = OpenAILLMAdapter(
+        "openai_llm",
+        app_config,
+        provider_config,
+        {"use_realtime": False},
+        session_factory=lambda: fake_session,
+    )
+    definition = MagicMock()
+    definition.phase = ToolPhase.IN_CALL
+    definition.to_openai_schema.return_value = {
+        "type": "function",
+        "function": {
+            "name": "captured_tool",
+            "description": "Captured generation tool",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+    captured_tool = MagicMock(definition=definition)
+    captured_registry = MagicMock()
+    captured_registry.get.return_value = captured_tool
+    live_registry = MagicMock()
+    live_registry.get.return_value = None
+    adapter.bind_tool_registry(captured_registry)
+    monkeypatch.setattr("src.pipelines.openai.tool_registry", live_registry)
+
+    await adapter.start()
+    await adapter.generate(
+        "call-1", "hello", {}, {"tools": ["captured_tool"]}
+    )
+
+    assert fake_session.requests[0]["json"]["tools"] == [
+        definition.to_openai_schema.return_value
+    ]
+    captured_registry.get.assert_called_once_with("captured_tool")
+    live_registry.get.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_openai_llm_stream_timeout_returns_empty_for_serial_fallback():
+    app_config = _build_app_config()
+    provider_config = OpenAIProviderConfig(**app_config.providers["openai"])
+    fake_session = _FakeStreamingSession(_TimeoutStream())
+    adapter = OpenAILLMAdapter(
+        "openai_llm",
+        app_config,
+        provider_config,
+        {"use_realtime": False, "timeout_sec": 1.5},
+        session_factory=lambda: fake_session,
+    )
+
+    await adapter.start()
+    chunks = [chunk async for chunk in adapter.generate_stream("call-1", "hello", {"system_prompt": "You are helpful."}, {})]
+
+    assert chunks == []
+    assert fake_session.requests[0]["json"]["stream"] is True
+    assert fake_session.requests[0]["timeout"] == 1.5
+    assert adapter._pending_tool_calls_by_call["call-1"] == []
+
+
+@pytest.mark.asyncio
+async def test_openai_llm_adapter_realtime(monkeypatch):
+    app_config = _build_app_config()
+    provider_config = OpenAIProviderConfig(**app_config.providers["openai"])
+    adapter = OpenAILLMAdapter("openai_llm", app_config, provider_config, {"use_realtime": True})
+
+    mock_ws = _MockWebSocket()
+
+    async def fake_connect(*args, **kwargs):
+        return mock_ws
+
+    monkeypatch.setattr("src.pipelines.openai.websockets.connect", fake_connect)
+
+    await adapter.start()
+    task = asyncio.create_task(
+        adapter.generate(
+            "call-1",
+            "hello listener",
+            {"system_prompt": "You are concise."},
+            {"use_realtime": True},
+        )
+    )
+
+    await asyncio.sleep(0)
+    mock_ws.push(json.dumps({"type": "response.output_text.delta", "delta": "response"}))
+    mock_ws.push(json.dumps({"type": "response.output_text.done"}))
+
+    result = await task
+    assert result == "response"
+
+    session_event = json.loads(mock_ws.sent[0])
+    assert session_event["type"] == "session.create"
+    response_event = json.loads(mock_ws.sent[1])
+    assert response_event["type"] == "response.create"
+
+
+@pytest.mark.asyncio
+async def test_openai_tts_adapter_synthesizes_chunks():
+    app_config = _build_app_config()
+    provider_config = OpenAIProviderConfig(**app_config.providers["openai"])
+
+    pcm_audio = b"\x00\x10" * 160  # 20 ms @ 8 kHz
+    buf = BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(8000)
+        wf.writeframes(pcm_audio)
+    wav_bytes = buf.getvalue()
+    fake_session = _FakeSession(wav_bytes)
+
+    adapter = OpenAITTSAdapter(
+        "openai_tts",
+        app_config,
+        provider_config,
+        {"response_format": "wav", "format": {"encoding": "mulaw", "sample_rate": 8000}},
+        session_factory=lambda: fake_session,
+    )
+
+    await adapter.start()
+    await adapter.open_call("call-1", {})
+
+    chunks = [chunk async for chunk in adapter.synthesize("call-1", "Hello caller", {})]
+    synthesized = b"".join(chunks)
+    expected = convert_pcm16le_to_target_format(pcm_audio, "mulaw")
+
+    assert synthesized == expected
+    request = fake_session.requests[0]
+    assert request["json"]["model"] == "gpt-4o-mini-tts"
+    assert request["json"]["voice"] == "alloy"
+    assert request["json"]["response_format"] == "wav"
+
+
+@pytest.mark.asyncio
+async def test_pipeline_orchestrator_registers_openai_adapters():
+    app_config = _build_app_config()
+    orchestrator = PipelineOrchestrator(app_config)
+    await orchestrator.start()
+
+    resolution = orchestrator.get_pipeline("call-1")
+    assert isinstance(resolution.stt_adapter, OpenAISTTAdapter)
+    assert isinstance(resolution.llm_adapter, OpenAILLMAdapter)
+    assert isinstance(resolution.tts_adapter, OpenAITTSAdapter)
+    assert resolution.tts_options["format"]["encoding"] == "mulaw"

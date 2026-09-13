@@ -1,0 +1,331 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# celery beat schedule file
+celerybeat-schedule
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# AI Models (large files, don't commit)
+/models/
+*.onnx
+*.gguf
+*.bin
+*.safetensors
+
+# Cursor/Windsurf IDE — ignore everything except rule files we track
+# (Must un-ignore directories first, then specific files)
+.cursor/*
+!.cursor/rules/
+.cursor/rules/*
+!.cursor/rules/asterisk_ai_voice_agent.mdc
+.windsurf/*
+!.windsurf/rules/
+.windsurf/rules/*
+!.windsurf/rules/asterisk_ai_voice_agent.md
+
+# Archives and old documentation
+"Project Requirement Documents"/
+
+# Taskmaster-AI
+.taskmaster/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+dev-debug.log
+
+# Dependency directories
+node_modules/
+
+# Editor directories and files
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Development test files (specific patterns only)
+playback_test_*.py
+simple_test_*.py
+snoop_test_*.py
+test_piper.py
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# Audio files (generated during testing)
+*.wav
+*.mp3
+*.ulaw
+*.alaw
+
+# Docker volumes
+docker-data/
+
+# Asterisk media files (generated at runtime)
+/asterisk_media
+
+# Shipped outbound prompt assets (tracked in git)
+!assets/
+!assets/outbound_prompts/
+!assets/outbound_prompts/**/*
+!assets/outbound_prompts/**/*.wav
+!assets/outbound_prompts/**/*.ulaw
+
+# Admin UI user database (generated at first login)
+config/users.json
+
+# One-time admin password written on first run / rotation (root-only secret)
+config/.first-run-password
+
+# Operator-specific config overrides (deep-merged over ai-agent.yaml at runtime)
+config/ai-agent.local.yaml
+
+# Logs and archived folders (development artifacts, not for main)
+logs/
+archived/**
+!archived/local-ai-server-improvements.md
+
+# IDE specific
+*.swp
+*.swo
+*~
+
+# Python specific
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+
+# But DO NOT ignore core components
+!src/core/
+!src/core/*.py
+!tests/
+!tests/*.py
+!examples/
+!examples/*.py
+
+# Documentation-only rule files (keep local, not in GA branch)
+# (Allow these specific artifacts to track on `develop` when needed.)
+!Agents.md
+!Gemini.md
+# CLAUDE.md / CLAUDE.local.md — hard-ignored on ALL branches (2026-06-12).
+# Personal AI-assistant context stays local-only and must never reach GitHub,
+# including develop. (Previously `!CLAUDE.md` allowed develop-branch tracking.)
+CLAUDE.md
+CLAUDE.local.md
+
+# Local diagnostics bundles
+server_diagnostics/
+
+# RCA artifacts (local-only; do not commit)
+rca-*/
+rca-out*/
+tmp_rca/
+rca-*.tar.gz
+logs/remote/
+# RCA analysis artifacts (should remain local-only)
+OPENAI_*RCA*.md
+logs/remote/
+
+# Archived development documentation (GA v4.0 cleanup)
+# (kept ignored by default; allow explicit tracked docs via negation rules above)
+
+# CLI binaries (built locally, not committed)
+bin/agent
+bin/agent-*
+bin/SHA256SUMS
+
+# Documentation files (keep local until explicitly requested to commit)
+COMPLETE_*.conf
+COMPLETE_*.md
+
+# Dialplan test/debug files (keep in archived/, never commit)
+dialplan_*.conf
+PRE_MERGE_CHECKLIST.md
+
+# IDE-specific rule files (tracked on develop, blocked from staging/main by CI gate)
+# (Agents.md already un-ignored above at line 238; Gemini.md already un-ignored at line 239)
+
+# Development-only documentation (Linear integration for contributors)
+docs/LINEAR_MCP_SETUP.md
+docs/linear-issues-community-features.md
+
+# AI Persona and IDE rule files — tracked on develop, blocked from staging/main by CI gate
+# (Remove these ignores so develop can track them. The CI workflow
+#  .github/workflows/block-dev-artifacts.yml prevents them from reaching staging/main.)
+# AVA.mdc — already tracked
+# .cursor/rules/ — un-ignored above
+# .windsurf/rules/ — un-ignored above
+
+# Vite cache
+.vite/
+
+# Development artifacts (not for main branch)
+.agent/
+.claude/
+.pm-triage/
+local_dev/
+walkthrough.md
+admin_ui/RELEASE_SUMMARY.md
+# Local PM / planning notes generated by tooling — never commit to main
+AAVA-PM.md
+DECISIONS.md
+JUDGMENT.md
+ONBOARDING_ANSWERED.md
+ONBOARDING_QUESTIONS.md
+STATUS.md
+
+# Call History Database (Milestone 21)
+# Exclude database files but keep the directory structure
+data/*.db
+data/*.sqlite
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/**/*.db
+data/**/*.sqlite
+data/**/*.db-journal
+data/**/*.db-wal
+data/**/*.db-shm
+data/operator/.migration.lock
+!data/.gitkeep
+
+# Custom (community) model entries — user-specific, persists across upgrades
+data/custom_models.json
+data/custom_models.json.lock
+
+# Secrets directory (Vertex AI credentials, API keys — never commit actual secrets)
+secrets/**
+!secrets/.gitkeep

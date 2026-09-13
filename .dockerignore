@@ -1,0 +1,151 @@
+# .dockerignore - Reduce Docker image size and exclude dev artifacts
+# AAVA-33: Aligned with .gitignore to exclude unnecessary files from Docker context
+
+# Version control
+.git/
+.gitignore
+.gitattributes
+
+# CI/CD
+.github/
+
+# Documentation
+*.md
+!README.md
+docs/
+Archived/
+archived/
+"Project Requirement Documents"/
+
+# IDE & Editor
+.cursor/
+.windsurf/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Python cache & compiled
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+# Testing & Coverage
+tests/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+coverage.xml
+*.cover
+.cache
+nosetests.xml
+
+# Development test files
+playback_test_*.py
+simple_test_*.py
+snoop_test_*.py
+test_piper.py
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+dev-debug.log
+
+# Environment files (SECURITY: Never include in image)
+.env
+.env.*
+.agent/
+data/
+secrets/
+.venv
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# Audio files (testing artifacts)
+*.wav
+*.mp3
+*.ulaw
+*.alaw
+!assets/audio/receptionist-typing-cc0.wav
+
+# Models (large files)
+models/
+*.onnx
+*.gguf
+*.bin
+*.safetensors
+
+# RCA & Diagnostics
+rca-*/
+rca-out*/
+tmp_rca/
+rca-*.tar.gz
+logs/remote/
+server_diagnostics/
+OPENAI_*RCA*.md
+
+# Docker
+docker-data/
+Dockerfile*
+!Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# Package managers
+node_modules/
+**/node_modules/
+admin_ui/frontend/node_modules/
+pip-wheel-metadata/
+
+# Taskmaster-AI
+.taskmaster/
+
+# Fleet deployment metadata and private rollback material
+.fleet-overlay/
+
+# Mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Type checkers
+.pyre/
+.pytype/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Keep only essential files for runtime:
+# - src/ (application code)
+# - config/ (YAML configs, no secrets)
+# - main.py (entrypoint)
+# - requirements.txt (dependencies)

@@ -1,0 +1,1093 @@
+import { useEffect, useMemo, useState } from 'react';
+import { ArrowUpCircle, RefreshCw, Play, AlertTriangle, CheckCircle2, XCircle } from 'lucide-react';
+import axios from 'axios';
+import { useConfirmDialog } from '../../hooks/useConfirmDialog';
+import { ConfigSection } from '../../components/ui/ConfigSection';
+import { ConfigCard } from '../../components/ui/ConfigCard';
+import { copyTextToClipboard, extractUpdateRecoveryCommands } from '../../utils/clipboard';
+
+type UpdateAvailable = boolean | null;
+
+interface UpdatesStatus {
+  local: { branch?: string; head_sha: string; describe: string; deployed_tag?: string | null };
+  remote?: { latest_tag: string; latest_tag_sha: string } | null;
+  update_available?: UpdateAvailable;
+  changelog_latest?: string | null;
+  error?: string | null;
+}
+
+interface UpdatePlan {
+  repo_root: string;
+  remote: string;
+  ref: string;
+  current_branch?: string;
+  target_branch?: string;
+  checkout?: boolean;
+  would_checkout?: boolean;
+  old_sha: string;
+  new_sha: string;
+  relation?: 'equal' | 'behind' | 'ahead' | 'diverged' | string;
+  code_changed?: boolean;
+  update_available: boolean;
+  dirty: boolean;
+  no_stash: boolean;
+  stash_untracked: boolean;
+  local_changes?: 'ask' | 'retain' | 'overwrite' | 'abort' | string;
+  would_stash: boolean;
+  would_overwrite?: boolean;
+  would_abort: boolean;
+  rebuild_mode: string;
+  compose_changed: boolean;
+  services_rebuild: string[];
+  services_restart: string[];
+  skipped_services?: Record<string, string>;
+  changed_file_count: number;
+  changed_files?: string[];
+  changed_files_truncated?: boolean;
+  local_file_count?: number;
+  local_files?: string[];
+  local_files_truncated?: boolean;
+  warnings?: string[];
+  active_calls?: number | null;
+  active_calls_reachable?: boolean;
+}
+
+interface BranchesResponse {
+  branches: string[];
+  error?: string | null;
+}
+
+interface UpdateJobResponse {
+  job: any;
+  log_tail?: string | null;
+}
+
+interface UpdateHistoryResponse {
+  jobs: any[];
+}
+
+interface UpdaterImageStatus {
+  status?: string;
+  phase?: string;
+  image?: string;
+  message?: string;
+  detail_tail?: string[];
+  started_at?: string;
+  updated_at?: string;
+  finished_at?: string;
+}
+
+const TERMINAL_UPDATE_STATUSES = new Set(['success', 'failed', 'validation_failed', 'stale']);
+const isTerminalUpdateStatus = (st?: string) => TERMINAL_UPDATE_STATUSES.has((st || '').toLowerCase());
+const ROLLBACK_ELIGIBLE_STATUSES = new Set(['failed', 'validation_failed', 'stale']);
+const canRollbackJob = (job: any, st?: string) =>
+  ROLLBACK_ELIGIBLE_STATUSES.has((st || String(job?.status || '')).toLowerCase()) &&
+  Boolean(job?.pre_update_branch) &&
+  Boolean(job?.backup_dir_rel);
+
+const UpdatesPage = () => {
+  const { confirm } = useConfirmDialog();
+  const [copiedJobId, setCopiedJobId] = useState<string | null>(null);
+  const [status, setStatus] = useState<UpdatesStatus | null>(null);
+  const [statusLoading, setStatusLoading] = useState(false);
+  const [statusError, setStatusError] = useState<string | null>(null);
+
+  const [branches, setBranches] = useState<string[]>([]);
+  const [branchesError, setBranchesError] = useState<string | null>(null);
+  const [selectedBranch, setSelectedBranch] = useState('main');
+  const [targetMode, setTargetMode] = useState<'stable' | 'main' | 'advanced'>('stable');
+  const [initialized, setInitialized] = useState(false);
+
+  // Default ON: the admin_ui frontend is image-baked, so skipping its rebuild leaves a
+  // stale UI (and possible FE/BE contract mismatch) after an update. Matches the CLI's
+  // --include-ui default (HIGH-6).
+  const [includeUI, setIncludeUI] = useState(true);
+  const [updateCliHost, setUpdateCliHost] = useState(true);
+  const [cliInstallPath, setCliInstallPath] = useState('');
+  const [forceActiveCalls, setForceActiveCalls] = useState(false);
+  const [plan, setPlan] = useState<UpdatePlan | null>(null);
+  const [planLoading, setPlanLoading] = useState(false);
+  const [planError, setPlanError] = useState<string | null>(null);
+  const [planRecoveryCopied, setPlanRecoveryCopied] = useState(false);
+
+  const [jobId, setJobId] = useState<string | null>(() => localStorage.getItem('aava_update_job_id'));
+  const [job, setJob] = useState<any>(null);
+  const [logTail, setLogTail] = useState<string>('');
+  const [fullLogLoading, setFullLogLoading] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [runError, setRunError] = useState<string | null>(null);
+  const [localChangesPolicy, setLocalChangesPolicy] = useState<'retain' | 'overwrite' | 'abort' | ''>('');
+  const [updaterImageStatus, setUpdaterImageStatus] = useState<UpdaterImageStatus | null>(null);
+
+  const [history, setHistory] = useState<any[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+
+  const pickDefaultBranch = (remoteBranches: string[], localBranch?: string) => {
+    const uniq = Array.from(new Set(remoteBranches || []));
+    if (selectedBranch && uniq.includes(selectedBranch)) return selectedBranch;
+    if (localBranch && uniq.includes(localBranch)) return localBranch;
+    if (uniq.includes('main')) return 'main';
+    return uniq[0] || 'main';
+  };
+
+  const targetRef = useMemo(() => {
+    if (targetMode === 'stable') return status?.remote?.latest_tag || '';
+    if (targetMode === 'main') return 'main';
+    return selectedBranch;
+  }, [targetMode, status, selectedBranch]);
+
+  const targetCheckout = useMemo(() => {
+    // For release tags, avoid branch switching semantics. For main/branches, allow checkout.
+    return targetMode !== 'stable';
+  }, [targetMode]);
+
+  const planHasActiveCalls = typeof plan?.active_calls === 'number' && plan.active_calls > 0;
+  const activeCallCheckUnavailable = plan?.active_calls_reachable === false;
+  const activeCallOverrideRequired = planHasActiveCalls || activeCallCheckUnavailable;
+  const localChangeChoiceRequired = Boolean(plan?.dirty && (!localChangesPolicy || localChangesPolicy === 'abort'));
+  const updaterImageVisible =
+    !!updaterImageStatus &&
+    updaterImageStatus.status !== 'idle' &&
+    (statusLoading || planLoading || running || updaterImageStatus.status === 'error');
+  const planRecoveryCommands = useMemo(() => extractUpdateRecoveryCommands(planError || ''), [planError]);
+
+  const loadBranches = async (opts?: { force?: boolean; localBranch?: string }) => {
+    setBranchesError(null);
+    try {
+      const branchesRes = await axios.get<BranchesResponse>('/api/system/updates/branches', {
+        // Branch listing requires git; if the updater image isn't present, allow a local build fallback.
+        params: { build_updater: true, force: opts?.force ? true : false },
+      });
+      setBranches(branchesRes.data.branches || []);
+      if (branchesRes.data.error) setBranchesError(branchesRes.data.error);
+      const def = pickDefaultBranch(branchesRes.data.branches || [], opts?.localBranch ?? status?.local?.branch);
+      setSelectedBranch(def);
+    } catch (err: any) {
+      setBranchesError(err.response?.data?.detail || err.message || 'Failed to load branches');
+      setBranches([]);
+    }
+  };
+  const checkUpdates = async (opts?: { force?: boolean }) => {
+    setInitialized(false);
+    setPlan(null);
+    setPlanError(null);
+    setRunError(null);
+    setStatusError(null);
+    setBranchesError(null);
+    setLocalChangesPolicy('');
+
+    setStatusLoading(true);
+    try {
+      const statusRes = await axios.get<UpdatesStatus>('/api/system/updates/status', {
+        // Allow updater image local-build fallback on explicit user action ("Check updates").
+        params: { check_remote: true, build_updater: true, force: opts?.force ? true : false },
+      });
+
+      setStatus(statusRes.data);
+      const localDef = statusRes.data.local?.branch || 'main';
+      setSelectedBranch(localDef === 'detached' ? 'main' : localDef);
+      setInitialized(true);
+
+      // Persist update status for Dashboard/SystemStatus widget
+      const updateInfo = {
+        checked_at: new Date().toISOString(),
+        update_available: statusRes.data.update_available ?? null,
+        local_version: statusRes.data.local?.deployed_tag || statusRes.data.local?.describe || null,
+        remote_version: statusRes.data.remote?.latest_tag || null,
+      };
+      localStorage.setItem('aava_update_status', JSON.stringify(updateInfo));
+
+      // Best-effort: load recent history after a check.
+      fetchHistory();
+
+      // Advanced mode: fetch branches for branch selection.
+      if (targetMode === 'advanced') {
+        loadBranches({ localBranch: localDef });
+      }
+    } catch (err: any) {
+      setStatusError(err.response?.data?.detail || err.message || 'Failed to check updates');
+      setInitialized(false);
+    } finally {
+      setStatusLoading(false);
+    }
+  };
+
+  const fetchHistory = async () => {
+    setHistoryLoading(true);
+    setHistoryError(null);
+    try {
+      const res = await axios.get<UpdateHistoryResponse>('/api/system/updates/history', { params: { limit: 10 } });
+      setHistory(res.data.jobs || []);
+    } catch (err: any) {
+      setHistoryError(err.response?.data?.detail || err.message || 'Failed to load update history');
+      setHistory([]);
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  const fetchUpdaterImageStatus = async () => {
+    try {
+      const res = await axios.get<{ status: UpdaterImageStatus }>('/api/system/updates/updater-image/status');
+      setUpdaterImageStatus(res.data.status || null);
+    } catch (_err) {
+      // Best-effort progress signal only; the main update/status request owns user-facing errors.
+    }
+  };
+
+  const copyRecoveryCommands = async (job: any) => {
+    const preBranch = job?.pre_update_branch;
+    const backupRel = job?.backup_dir_rel;
+    if (!preBranch || !backupRel) return;
+
+    const shQuote = (value: unknown) => `'${String(value ?? '').replace(/'/g, "'\\''")}'`;
+    const composeTargets = job?.include_ui ? 'ai_engine local_ai_server admin_ui' : 'ai_engine local_ai_server';
+    const repoRoot = job?.repo_root || job?.plan?.repo_root || '/root/Asterisk-AI-Voice-Agent';
+    const text = [
+      '# Roll back to pre-update code + restore operator config',
+      '# NOTE: this restores code + config only. It does NOT restore agents.db or call_history.db.',
+      '# Restore DB snapshots manually only when you are sure newer call/agent data can be discarded.',
+      `REPO=${shQuote(repoRoot)}`,
+      'cd "$REPO"',
+      'git config --global --add safe.directory "$REPO"',
+      '',
+      `git checkout ${shQuote(preBranch)}`,
+      '',
+      `cp -- ${shQuote(`${backupRel}/.env`)} .env`,
+      `cp -- ${shQuote(`${backupRel}/config/ai-agent.yaml`)} config/ai-agent.yaml`,
+      `cp -- ${shQuote(`${backupRel}/config/ai-agent.local.yaml`)} config/ai-agent.local.yaml 2>/dev/null || true`,
+      `cp -- ${shQuote(`${backupRel}/config/users.json`)} config/users.json`,
+      `rm -rf config/contexts && cp -r -- ${shQuote(`${backupRel}/config/contexts`)} config/contexts`,
+      '',
+      `docker compose up -d --build ${composeTargets}`,
+    ].join('\n');
+
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedJobId(job.job_id);
+      setTimeout(() => setCopiedJobId(null), 2000);
+    } catch (e) {
+      window.prompt('Copy recovery commands:', text);
+    }
+  };
+
+  const copyPlanErrorRecovery = async () => {
+    if (!planRecoveryCommands) return;
+    const copied = await copyTextToClipboard(planRecoveryCommands);
+    if (!copied) {
+      window.prompt('Copy recovery commands:', planRecoveryCommands);
+      return;
+    }
+    setPlanRecoveryCopied(true);
+    setTimeout(() => setPlanRecoveryCopied(false), 2000);
+  };
+
+  const rollbackFromJob = async (sourceJob: any) => {
+    const fromJobId = sourceJob?.job_id;
+    if (!fromJobId) return;
+
+    const preBranch = sourceJob?.pre_update_branch || 'unknown';
+    const backupRel = sourceJob?.backup_dir_rel || 'unknown';
+    const ok = await confirm({
+      title: 'Start Rollback?',
+      description: `Source job: ${fromJobId}\nPre-update branch: ${preBranch}\nBackup: ${backupRel}\n\nThis will checkout the pre-update branch and restore operator config from the backup. Services may rebuild/restart.\n\nNote: this restores code + config only — it does NOT touch agents.db. To revert the YAML->agents.db migration too, see docs/OPERATOR_MIGRATION.md (Rollback).`,
+      confirmText: 'Start Rollback',
+      variant: 'destructive'
+    });
+    if (!ok) return;
+
+    const rollbackForceActiveCalls = await confirm({
+      title: 'Active-Call Safety',
+      description: 'Rollback will refuse to rebuild or restart ai_engine if active calls are detected.\n\nChoose Keep Guard for normal safe rollback behavior. Choose Enable Override only if you intentionally want rollback to proceed even when calls are active.',
+      confirmText: 'Enable Override',
+      cancelText: 'Keep Guard',
+      variant: 'destructive'
+    });
+
+    setRunError(null);
+    try {
+      const res = await axios.post('/api/system/updates/rollback', {
+        from_job_id: fromJobId,
+        force_active_calls: rollbackForceActiveCalls,
+      });
+      const id = res.data.job_id;
+      setJobId(id);
+      localStorage.setItem('aava_update_job_id', id);
+      setRunning(true);
+    } catch (err: any) {
+      setRunError(err.response?.data?.detail || err.message || 'Failed to start rollback');
+    }
+  };
+
+  const fetchPlan = async (ref?: string) => {
+    setPlanLoading(true);
+    setPlanError(null);
+    try {
+      const res = await axios.get('/api/system/updates/plan', {
+        params: { ref: ref || targetRef, include_ui: includeUI, checkout: targetCheckout, local_changes: localChangesPolicy || 'ask' },
+      });
+      setPlan(res.data.plan);
+    } catch (err: any) {
+      setPlanError(err.response?.data?.detail || err.message || 'Failed to compute update plan');
+    } finally {
+      setPlanLoading(false);
+    }
+  };
+
+  const fetchJob = async (id: string) => {
+    const res = await axios.get<UpdateJobResponse>(`/api/system/updates/jobs/${id}`);
+    setJob(res.data.job);
+    setLogTail(res.data.log_tail || '');
+    const st = (res.data.job?.status || '').toLowerCase();
+    setRunning(!isTerminalUpdateStatus(st));
+    setRunError(null);
+
+    if (isTerminalUpdateStatus(st)) {
+      fetchHistory();
+    }
+    return st;
+  };
+
+  const fetchFullLog = async () => {
+    if (!jobId) return;
+    setFullLogLoading(true);
+    try {
+      const res = await axios.get<{ job_id: string; log: string }>(`/api/system/updates/jobs/${jobId}/log`);
+      setLogTail(res.data.log || '');
+    } catch (err: any) {
+      setRunError(err.response?.data?.detail || err.message || 'Failed to load full log');
+    } finally {
+      setFullLogLoading(false);
+    }
+  };
+
+  const runUpdate = async () => {
+    setRunError(null);
+    if (!initialized) {
+      setRunError('Click “Check updates” first.');
+      return;
+    }
+    if (!plan) {
+      setRunError('Wait for the preview to load, then proceed.');
+      return;
+    }
+    if (plan.dirty && !localChangesPolicy) {
+      setRunError('Choose how to handle local code changes before starting the update.');
+      return;
+    }
+    if (plan.dirty && localChangesPolicy === 'abort') {
+      setRunError('Update not started. Local code changes are still present.');
+      return;
+    }
+
+    const rebuild = plan.services_rebuild?.length ? plan.services_rebuild.join(', ') : 'none';
+    const restart = plan.services_restart?.length ? plan.services_restart.join(', ') : 'none';
+    const skipped =
+      plan.skipped_services && Object.keys(plan.skipped_services).length
+        ? Object.entries(plan.skipped_services)
+            .map(([k, v]) => `${k}:${v}`)
+            .join(', ')
+        : 'none';
+
+    const localChangeText =
+      plan.dirty
+        ? localChangesPolicy === 'retain'
+          ? 'retain local tracked changes (stash and reapply; may conflict)'
+          : localChangesPolicy === 'overwrite'
+            ? 'overwrite local tracked code changes and restore operator config from backup'
+            : 'abort if local tracked changes are still present'
+        : 'none detected';
+
+    const ok = await confirm({
+      title: 'Proceed with Update?',
+      description: `Target: ${targetRef || 'unknown'}\nMode: ${targetMode === 'stable' ? 'stable release' : targetMode === 'main' ? 'main hotfixes' : 'advanced branch'}\nUpdate UI: ${includeUI ? 'yes' : 'no'}\nUpdate CLI: ${updateCliHost ? 'yes' : 'no'}\nLocal changes: ${localChangeText}\nWill rebuild: ${rebuild}\nWill restart: ${restart}\nSkipped services: ${skipped}\nFiles changed: ${plan.changed_file_count ?? 'unknown'}\nActive calls: ${typeof plan.active_calls === 'number' ? plan.active_calls : 'unknown'}${forceActiveCalls ? ' (override enabled)' : ''}\n\nServices may restart during update.`,
+      confirmText: 'Start Update',
+      variant: 'default'
+    });
+    if (!ok) return;
+
+    try {
+      const res = await axios.post('/api/system/updates/run', {
+        include_ui: includeUI,
+        ref: targetRef,
+        checkout: targetCheckout,
+        local_changes: localChangesPolicy || 'abort',
+        update_cli_host: updateCliHost,
+        cli_install_path: cliInstallPath.trim() || null,
+        force_active_calls: forceActiveCalls,
+      });
+      const id = res.data.job_id;
+      setJobId(id);
+      localStorage.setItem('aava_update_job_id', id);
+      setRunning(true);
+    } catch (err: any) {
+      setRunError(err.response?.data?.detail || err.message || 'Failed to start update');
+    }
+  };
+
+  useEffect(() => {
+    if (!initialized) return;
+    if (!targetRef) return;
+    fetchPlan(targetRef);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialized, includeUI, targetRef, targetCheckout, localChangesPolicy]);
+
+  useEffect(() => {
+    if (!jobId) return;
+    let cancelled = false;
+    let notFoundCount = 0;
+    const MAX_NOT_FOUND = 10; // ~20s at 2s intervals
+    const tick = async () => {
+      try {
+        const st = await fetchJob(jobId);
+        notFoundCount = 0;
+        if (!cancelled && isTerminalUpdateStatus(st)) {
+          window.clearInterval(interval);
+        }
+      } catch (err: any) {
+        const status = err?.response?.status;
+        // Immediately after starting a job, there can be a brief delay before the updater container
+        // writes its state/log files. Treat 404 as transient to avoid spurious UI errors.
+        if (!cancelled) {
+          if (status === 404) {
+            notFoundCount += 1;
+            if (notFoundCount < MAX_NOT_FOUND) return;
+            window.clearInterval(interval);
+            setRunning(false);
+            setJob(null);
+            setJobId(null);
+            localStorage.removeItem('aava_update_job_id');
+            setRunError('Update job not found (may be stale or pruned).');
+            return;
+          }
+          const msg = err.response?.data?.detail || err.message || 'Failed to read update job';
+          if (running || job?.include_ui || includeUI) {
+            setRunError(`Waiting for Admin UI/update job to come back online: ${msg}`);
+            return;
+          }
+          setRunError(msg);
+        }
+      }
+    };
+    const interval = window.setInterval(tick, 2000);
+    tick();
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [jobId]);
+
+  useEffect(() => {
+    if (!(statusLoading || planLoading || running)) return;
+    fetchUpdaterImageStatus();
+    const interval = window.setInterval(fetchUpdaterImageStatus, 1500);
+    return () => window.clearInterval(interval);
+  }, [statusLoading, planLoading, running]);
+
+  useEffect(() => {
+    if (!activeCallOverrideRequired && forceActiveCalls) {
+      setForceActiveCalls(false);
+    }
+  }, [activeCallOverrideRequired, forceActiveCalls]);
+
+  const renderUpdaterImageStatus = (section: 'status' | 'plan' | 'run') => {
+    if (!updaterImageVisible) return null;
+    if (section === 'status' && !statusLoading && updaterImageStatus?.status !== 'error') return null;
+    if (section === 'plan' && (!planLoading || statusLoading)) return null;
+    if (section === 'run' && (!running || statusLoading || planLoading)) return null;
+    const st = updaterImageStatus?.status || 'unknown';
+    const phase = updaterImageStatus?.phase || 'updater image';
+    const tail = updaterImageStatus?.detail_tail || [];
+    const isActive = st === 'running';
+    const isError = st === 'error';
+    return (
+      <div
+        className={`rounded-md border p-3 text-xs ${
+          isError
+            ? 'border-destructive/30 bg-destructive/10'
+            : 'border-border bg-card/30'
+        }`}
+      >
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2 font-medium">
+            {isError ? (
+              <XCircle className="w-3.5 h-3.5 text-destructive" />
+            ) : isActive ? (
+              <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <CheckCircle2 className="w-3.5 h-3.5" />
+            )}
+            <span className="capitalize">{phase.replace(/_/g, ' ')}</span>
+          </div>
+          {updaterImageStatus?.updated_at && <div className="text-muted-foreground">{updaterImageStatus.updated_at}</div>}
+        </div>
+        <div className="mt-1 text-muted-foreground">{updaterImageStatus?.message || 'Preparing updater image'}</div>
+        {updaterImageStatus?.image && <div className="mt-1 font-mono break-all">{updaterImageStatus.image}</div>}
+        {tail.length ? (
+          <pre className="mt-2 max-h-[160px] overflow-auto whitespace-pre-wrap break-words rounded-md bg-background/70 p-2 font-mono">
+            {tail.join('\n')}
+          </pre>
+        ) : null}
+      </div>
+    );
+  };
+
+  const previewLabel = useMemo(() => {
+    if (!initialized) return 'Not checked';
+    if (!plan) return planLoading ? 'Loading preview…' : 'Preview unavailable';
+    if (plan.would_abort) return 'Blocked (dirty tree)';
+    if (plan.relation === 'behind') return 'Update available';
+    if (plan.relation === 'equal') return 'Up to date';
+    if (plan.relation === 'ahead') return 'Local ahead';
+    if (plan.relation === 'diverged') return 'Diverged';
+    return plan.relation || 'Unknown';
+  }, [initialized, plan, planLoading]);
+
+  const previewIcon = useMemo(() => {
+    if (!initialized) return <AlertTriangle className="w-4 h-4 text-muted-foreground" />;
+    if (planLoading) return <RefreshCw className="w-4 h-4 animate-spin text-muted-foreground" />;
+    if (!plan) return <AlertTriangle className="w-4 h-4 text-muted-foreground" />;
+    if (plan.relation === 'behind') return <AlertTriangle className="w-4 h-4 text-yellow-500" />;
+    if (plan.relation === 'equal' || plan.relation === 'ahead') return <CheckCircle2 className="w-4 h-4 text-primary" />;
+    if (plan.relation === 'diverged') return <AlertTriangle className="w-4 h-4 text-yellow-500" />;
+    return <AlertTriangle className="w-4 h-4 text-muted-foreground" />;
+  }, [initialized, plan, planLoading]);
+
+  return (
+    <ConfigSection
+      title="Updates"
+      description="Mimics a GitHub-style update flow: check updates, pick a branch, preview file/container impact, then proceed."
+    >
+      <ConfigCard>
+        <div className="flex items-center justify-between gap-3 mb-3">
+          <div className="flex items-center gap-2">
+            <ArrowUpCircle className="w-5 h-5" />
+            <div className="text-base font-semibold">Check Updates</div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => checkUpdates()}
+              disabled={statusLoading}
+              className="inline-flex items-center gap-2 px-3 py-2 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+              title="Check updates"
+            >
+              <RefreshCw className={`w-4 h-4 ${statusLoading ? 'animate-spin' : ''}`} />
+              {statusLoading ? 'Checking…' : 'Check updates'}
+            </button>
+            <button
+              onClick={() => checkUpdates({ force: true })}
+              disabled={statusLoading}
+              className="inline-flex items-center gap-2 px-3 py-2 rounded-md border border-border hover:bg-accent disabled:opacity-50"
+              title="Force refresh (ignore cached status)"
+            >
+              <RefreshCw className="w-4 h-4" />
+              Force refresh
+            </button>
+          </div>
+        </div>
+
+        <div className="space-y-2">
+          {statusError && <div className="text-sm text-destructive">{statusError}</div>}
+          {branchesError && <div className="text-sm text-muted-foreground">{branchesError}</div>}
+          {status && status.error && <div className="text-sm text-muted-foreground">{status.error}</div>}
+          {renderUpdaterImageStatus('status')}
+
+          <div className="flex items-center gap-2">
+            {previewIcon}
+            <div className="text-sm font-medium">{previewLabel}</div>
+          </div>
+
+          {status ? (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
+              <div>
+                <div className="text-xs text-muted-foreground">Local (branch)</div>
+                <div className="font-mono text-xs break-all">{status.local?.branch || 'Unknown'}</div>
+                <div className="mt-1 text-xs text-muted-foreground">Deployed tag</div>
+                <div className="font-mono text-xs break-all">{status.local?.deployed_tag || 'Unknown'}</div>
+              </div>
+              <div>
+                <div className="text-xs text-muted-foreground">Remote (latest v*)</div>
+                <div className="font-mono text-xs break-all">{status.remote?.latest_tag || 'Unknown'}</div>
+              </div>
+            </div>
+          ) : (
+            <div className="text-sm text-muted-foreground">Click “Check updates” to load status and release info.</div>
+          )}
+
+          {status?.changelog_latest ? (
+            <div className="border border-border rounded-lg bg-card/30 p-3">
+              <div className="text-xs text-muted-foreground mb-2">Latest release notes</div>
+              <pre className="text-xs font-mono whitespace-pre-wrap break-words max-h-[260px] overflow-auto">{status.changelog_latest}</pre>
+            </div>
+          ) : null}
+        </div>
+      </ConfigCard>
+
+      <ConfigCard>
+        <div className="flex items-center justify-between gap-3 mb-3">
+          <div className="flex items-center gap-2">
+            <RefreshCw className="w-5 h-5" />
+            <div className="text-base font-semibold">Select Target + Preview</div>
+          </div>
+          <button
+            onClick={() => fetchPlan()}
+            disabled={!initialized || planLoading}
+            className="p-1.5 hover:bg-accent rounded-lg transition-colors disabled:opacity-50"
+            title="Refresh preview"
+          >
+            <RefreshCw className={`w-4 h-4 ${planLoading ? 'animate-spin' : ''}`} />
+          </button>
+        </div>
+
+        <div className="space-y-3">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div>
+              <div className="text-xs text-muted-foreground mb-2">Update target</div>
+              <div className="space-y-2 text-sm">
+                <label className="flex items-center gap-2">
+                  <input
+                    type="radio"
+                    name="aava-update-target"
+                    checked={targetMode === 'stable'}
+                    onChange={() => setTargetMode('stable')}
+                    className="rounded border-border"
+                  />
+                  Stable (latest release tag)
+                  <span className="ml-auto font-mono text-xs text-muted-foreground">{status?.remote?.latest_tag || 'unknown'}</span>
+                </label>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="radio"
+                    name="aava-update-target"
+                    checked={targetMode === 'main'}
+                    onChange={() => setTargetMode('main')}
+                    className="rounded border-border"
+                  />
+                  Main (hotfixes)
+                  <span className="ml-auto font-mono text-xs text-muted-foreground">main</span>
+                </label>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="radio"
+                    name="aava-update-target"
+                    checked={targetMode === 'advanced'}
+                    onChange={() => {
+                      setTargetMode('advanced');
+                      if (initialized && !branches.length) loadBranches();
+                    }}
+                    className="rounded border-border"
+                  />
+                  Advanced (pick a branch)
+                  <span className="ml-auto text-xs text-muted-foreground">custom</span>
+                </label>
+              </div>
+
+              {targetMode === 'advanced' && (
+                <div className="mt-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="text-xs text-muted-foreground">Target branch</div>
+                    <button
+                      onClick={() => loadBranches({ force: true })}
+                      disabled={!initialized}
+                      className="text-xs px-2 py-1 rounded-md border border-border hover:bg-accent disabled:opacity-50"
+                      title="Refresh branches"
+                    >
+                      Refresh branches
+                    </button>
+                  </div>
+                  <select
+                    value={selectedBranch}
+                    onChange={(e) => setSelectedBranch(e.target.value)}
+                    disabled={!initialized || !branches.length}
+                    className="w-full mt-1 px-3 py-2 rounded-md border border-border bg-background text-sm"
+                  >
+                    {(branches.length ? branches : [selectedBranch]).map((b) => (
+                      <option key={b} value={b}>
+                        {b}
+                      </option>
+                    ))}
+                  </select>
+                  {!branches.length && initialized && (
+                    <div className="mt-1 text-xs text-muted-foreground">No branches returned.</div>
+                  )}
+                </div>
+              )}
+            </div>
+            <div className="flex flex-col justify-end gap-2">
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={includeUI}
+                  onChange={(e) => setIncludeUI(e.target.checked)}
+                  className="rounded border-border"
+                />
+                Update UI too (allow admin_ui rebuild/restart)
+              </label>
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={updateCliHost}
+                  onChange={(e) => setUpdateCliHost(e.target.checked)}
+                  className="rounded border-border"
+                />
+                Update agent CLI too (best-effort)
+              </label>
+            </div>
+          </div>
+
+          {updateCliHost && (
+            <div>
+              <div className="text-xs text-muted-foreground mb-1">Agent CLI install path (optional)</div>
+              <input
+                value={cliInstallPath}
+                onChange={(e) => setCliInstallPath(e.target.value)}
+                placeholder="auto (detect existing or install to /usr/local/bin/agent)"
+                className="w-full px-3 py-2 rounded-md border border-border bg-background text-sm font-mono"
+              />
+              <div className="mt-1 text-xs text-muted-foreground">Leave blank for auto-detect + default install.</div>
+            </div>
+          )}
+
+          {planError && (
+            <div className="rounded-lg border border-destructive/40 bg-destructive/5 p-3 text-sm">
+              <div className="flex items-center justify-between gap-3">
+                <div className="font-medium text-destructive">Update preview failed</div>
+                {planRecoveryCommands && (
+                  <button
+                    type="button"
+                    onClick={copyPlanErrorRecovery}
+                    className="shrink-0 rounded-md border border-border px-2 py-1 text-xs hover:bg-accent"
+                  >
+                    {planRecoveryCopied ? 'Copied' : 'Copy recovery commands'}
+                  </button>
+                )}
+              </div>
+              <pre className="mt-2 max-h-[420px] overflow-auto whitespace-pre-wrap break-words rounded-md bg-background/80 p-3 font-mono text-xs text-foreground">
+                {planError}
+              </pre>
+              <a
+                href="https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/blob/main/docs/INSTALLATION.md#update-planner-recovery-including-issue-518"
+                target="_blank"
+                rel="noreferrer"
+                className="mt-2 inline-block text-xs text-primary hover:underline"
+              >
+                Open the full upgrade recovery guide
+              </a>
+            </div>
+          )}
+          {renderUpdaterImageStatus('plan')}
+
+          {plan && (
+            <div className="space-y-2 text-sm">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                <div className="p-3 border border-border rounded-lg">
+                  <div className="text-xs text-muted-foreground">Will rebuild</div>
+                  <div className="mt-1 font-mono text-xs">{plan.services_rebuild?.length ? plan.services_rebuild.join(', ') : 'none'}</div>
+                </div>
+                <div className="p-3 border border-border rounded-lg">
+                  <div className="text-xs text-muted-foreground">Will restart</div>
+                  <div className="mt-1 font-mono text-xs">{plan.services_restart?.length ? plan.services_restart.join(', ') : 'none'}</div>
+                </div>
+                <div className="p-3 border border-border rounded-lg">
+                  <div className="text-xs text-muted-foreground">Skipped</div>
+                  <div className="mt-1 font-mono text-xs">
+                    {plan.skipped_services && Object.keys(plan.skipped_services).length
+                      ? Object.entries(plan.skipped_services)
+                          .map(([k, v]) => `${k}:${v}`)
+                          .join(', ')
+                      : 'none'}
+                  </div>
+                </div>
+              </div>
+
+              <div className="text-xs text-muted-foreground">
+                Target: <span className="font-mono">{targetRef || 'unknown'}</span> • files changed: {plan.changed_file_count} • compose changed:{' '}
+                {plan.compose_changed ? 'yes' : 'no'}
+              </div>
+
+              {plan.warnings?.length ? (
+                <div className="text-xs text-yellow-500">
+                  {plan.warnings.map((w, i) => (
+                    <div key={i}>{w}</div>
+                  ))}
+                </div>
+              ) : null}
+
+              {plan.dirty ? (
+                <div className="rounded-md border border-yellow-500/40 bg-yellow-500/10 p-3 text-xs text-yellow-700 dark:text-yellow-300">
+                  <div className="font-medium">Local code changes detected</div>
+                  <div className="mt-1 text-muted-foreground">
+                    Choose whether the updater should keep tracked local edits or replace them with the release code. Operator config is backed up before either path.
+                  </div>
+                  <div className="mt-3 space-y-2">
+                    <label className="flex items-start gap-2">
+                      <input
+                        type="radio"
+                        name="aava-local-changes"
+                        checked={localChangesPolicy === 'retain'}
+                        onChange={() => setLocalChangesPolicy('retain')}
+                        className="mt-0.5 rounded border-border"
+                      />
+                      <span>
+                        <span className="font-medium">Retain local changes</span>
+                        <span className="block text-muted-foreground">Stash and reapply tracked edits after the update. This can still conflict if the release changed the same code.</span>
+                      </span>
+                    </label>
+                    <label className="flex items-start gap-2">
+                      <input
+                        type="radio"
+                        name="aava-local-changes"
+                        checked={localChangesPolicy === 'overwrite'}
+                        onChange={() => setLocalChangesPolicy('overwrite')}
+                        className="mt-0.5 rounded border-border"
+                      />
+                      <span>
+                        <span className="font-medium">Overwrite local code changes</span>
+                        <span className="block text-muted-foreground">Discard tracked source-code edits and restore operator config from the pre-update backup.</span>
+                      </span>
+                    </label>
+                    <label className="flex items-start gap-2">
+                      <input
+                        type="radio"
+                        name="aava-local-changes"
+                        checked={localChangesPolicy === 'abort'}
+                        onChange={() => setLocalChangesPolicy('abort')}
+                        className="mt-0.5 rounded border-border"
+                      />
+                      <span>
+                        <span className="font-medium">Abort update</span>
+                        <span className="block text-muted-foreground">Stop before changing the checkout so the local edits can be reviewed manually.</span>
+                      </span>
+                    </label>
+                  </div>
+                  {plan.local_files?.length ? (
+                    <pre className="mt-3 max-h-[160px] overflow-auto whitespace-pre-wrap break-words rounded-md bg-background/70 p-2 font-mono">
+                      {plan.local_files.join('\n')}
+                      {plan.local_files_truncated ? '\n...(truncated)' : ''}
+                    </pre>
+                  ) : null}
+                </div>
+              ) : null}
+
+              {activeCallOverrideRequired ? (
+                <div className="rounded-md border border-yellow-500/40 bg-yellow-500/10 p-3 text-xs text-yellow-700 dark:text-yellow-300">
+                  <div className="font-medium">
+                    {planHasActiveCalls ? `Active calls detected: ${plan.active_calls}` : 'Active-call status unavailable'}
+                  </div>
+                  {!planHasActiveCalls && (
+                    <div className="mt-1 text-muted-foreground">
+                      The updater could not verify whether calls are active. Explicitly allow the update to proceed.
+                    </div>
+                  )}
+                  <label className="mt-2 flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={forceActiveCalls}
+                      onChange={(e) => setForceActiveCalls(e.target.checked)}
+                      className="rounded border-border"
+                    />
+                    Allow update to restart services while call status is active or unknown
+                  </label>
+                </div>
+              ) : null}
+
+              {plan.changed_files?.length ? (
+                <div className="border border-border rounded-lg bg-card/30 p-3">
+                  <div className="text-xs text-muted-foreground mb-2">
+                    Files to update ({plan.changed_files.length}
+                    {plan.changed_files_truncated ? '+' : ''})
+                  </div>
+                  <pre className="text-xs font-mono whitespace-pre-wrap break-words max-h-[260px] overflow-auto">
+                    {plan.changed_files.join('\n')}
+                    {plan.changed_files_truncated ? '\n…(truncated)' : ''}
+                  </pre>
+                </div>
+              ) : null}
+            </div>
+          )}
+
+          {!plan && initialized && !planLoading && !planError && (
+            <div className="text-sm text-muted-foreground">Select a target to see a preview.</div>
+          )}
+          {!initialized && <div className="text-sm text-muted-foreground">Click “Check updates” first.</div>}
+        </div>
+      </ConfigCard>
+
+      <ConfigCard>
+        <div className="flex items-center gap-2 mb-3">
+          <Play className="w-5 h-5" />
+          <div className="text-base font-semibold">Proceed</div>
+        </div>
+
+        <div className="space-y-3">
+          {runError && <div className="text-sm text-destructive">{runError}</div>}
+          {renderUpdaterImageStatus('run')}
+          <div className="flex items-center gap-2">
+            <button
+              onClick={runUpdate}
+              disabled={running || !initialized || !plan || localChangeChoiceRequired || (activeCallOverrideRequired && !forceActiveCalls)}
+              className="inline-flex items-center gap-2 px-3 py-2 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+              title="Proceed"
+            >
+              <Play className="w-4 h-4" />
+              {running ? 'Update running…' : 'Proceed'}
+            </button>
+            {job && (
+              <div className="text-sm text-muted-foreground">
+                Job: <span className="font-mono text-xs">{job.job_id || jobId}</span>
+              </div>
+            )}
+          </div>
+
+          {job && (
+            <div className="flex items-center gap-2 text-sm">
+              {String(job.status || '').toLowerCase() === 'success' ? (
+                <CheckCircle2 className="w-4 h-4 text-primary" />
+              ) : ['failed', 'validation_failed', 'stale'].includes(String(job.status || '').toLowerCase()) ? (
+                <XCircle className="w-4 h-4 text-destructive" />
+              ) : (
+                <RefreshCw className="w-4 h-4 animate-spin text-muted-foreground" />
+              )}
+              <div className="font-medium capitalize">{String(job.status || 'running').replace(/_/g, ' ')}</div>
+              {job.exit_code !== undefined && job.exit_code !== null && <div className="text-muted-foreground">exit={job.exit_code}</div>}
+            </div>
+          )}
+
+          {job?.failure_reason && (
+            <div className="rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm">
+              <div className="font-medium text-destructive">{job.failed_stage ? String(job.failed_stage).replace(/_/g, ' ') : 'Failure reason'}</div>
+              <div className="mt-1 text-muted-foreground">{job.failure_reason}</div>
+            </div>
+          )}
+
+          <div className="border border-border rounded-lg bg-card/30 p-3">
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <div className="text-xs text-muted-foreground">Live output (tail)</div>
+              {jobId && (
+                <button
+                  onClick={fetchFullLog}
+                  disabled={fullLogLoading}
+                  className="text-xs px-2 py-1 rounded-md border border-border hover:bg-accent disabled:opacity-50"
+                  title="Load full log"
+                >
+                  {fullLogLoading ? 'Loading…' : 'Load full log'}
+                </button>
+              )}
+            </div>
+            <pre className="text-xs font-mono whitespace-pre-wrap break-words max-h-[340px] overflow-auto">
+              {logTail ||
+                (job && isTerminalUpdateStatus(String(job.status || '').toLowerCase())
+                  ? 'No log available for this job.'
+                  : 'No output yet.')}
+            </pre>
+          </div>
+        </div>
+      </ConfigCard>
+
+      <ConfigCard>
+        <div className="flex items-center justify-between gap-3 mb-3">
+          <div className="flex items-center gap-2">
+            <ArrowUpCircle className="w-5 h-5" />
+            <div className="text-base font-semibold">Recent Runs</div>
+          </div>
+          <button
+            onClick={fetchHistory}
+            disabled={historyLoading}
+            className="p-1.5 hover:bg-accent rounded-lg transition-colors disabled:opacity-50"
+            title="Refresh history"
+          >
+            <RefreshCw className={`w-4 h-4 ${historyLoading ? 'animate-spin' : ''}`} />
+          </button>
+        </div>
+
+        {historyError && <div className="text-sm text-destructive mb-2">{historyError}</div>}
+        {!initialized && <div className="text-sm text-muted-foreground mb-2">Click “Check updates” to load history.</div>}
+
+        <div className="overflow-auto border border-border rounded-lg">
+          <table className="min-w-[780px] w-full text-sm">
+            <thead className="bg-muted/30">
+              <tr className="text-left">
+                <th className="px-3 py-2 text-xs text-muted-foreground">When</th>
+                <th className="px-3 py-2 text-xs text-muted-foreground">Branch</th>
+                <th className="px-3 py-2 text-xs text-muted-foreground">Result</th>
+                <th className="px-3 py-2 text-xs text-muted-foreground">UI</th>
+                <th className="px-3 py-2 text-xs text-muted-foreground">Rebuild</th>
+                <th className="px-3 py-2 text-xs text-muted-foreground">Restart</th>
+                <th className="px-3 py-2 text-xs text-muted-foreground">Files</th>
+                <th className="px-3 py-2 text-xs text-muted-foreground">Recovery</th>
+              </tr>
+            </thead>
+            <tbody>
+              {history.length ? (
+                history.map((h) => {
+                  const st = String(h.status || '').toLowerCase();
+                  const plan = h.plan || {};
+                  const rebuild = Array.isArray(plan.services_rebuild) ? plan.services_rebuild.join(', ') : '';
+                  const restart = Array.isArray(plan.services_restart) ? plan.services_restart.join(', ') : '';
+                  const files = plan.changed_file_count ?? '';
+                  const when = h.finished_at || h.started_at || '';
+                  return (
+                    <tr key={h.job_id} className="border-t border-border">
+                      <td className="px-3 py-2 font-mono text-xs whitespace-nowrap">{when || '-'}</td>
+                      <td className="px-3 py-2 font-mono text-xs">{h.ref || '-'}</td>
+                      <td className="px-3 py-2">
+                        {st === 'success' ? (
+                          <span className="inline-flex items-center gap-1 text-primary">
+                            <CheckCircle2 className="w-4 h-4" /> success
+                          </span>
+                        ) : ['failed', 'validation_failed', 'stale'].includes(st) ? (
+                          <span className="inline-flex items-center gap-1 text-destructive">
+                            <XCircle className="w-4 h-4" /> {st.replace(/_/g, ' ')}
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1 text-muted-foreground">
+                            <RefreshCw className="w-4 h-4 animate-spin" /> {st || 'unknown'}
+                          </span>
+                        )}
+                      </td>
+                      <td className="px-3 py-2 text-xs">{h.include_ui ? 'yes' : 'no'}</td>
+                      <td className="px-3 py-2 font-mono text-xs">{rebuild || '-'}</td>
+                      <td className="px-3 py-2 font-mono text-xs">{restart || '-'}</td>
+                      <td className="px-3 py-2 font-mono text-xs">{files !== '' ? String(files) : '-'}</td>
+                      <td className="px-3 py-2">
+                        {canRollbackJob(h, st) ? (
+                          <div className="inline-flex items-center gap-2">
+                            <button
+                              onClick={() => rollbackFromJob(h)}
+                              className="px-2 py-1 text-xs rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
+                              title="Rollback using this job's backup"
+                            >
+                              Rollback
+                            </button>
+                            <button
+                              onClick={() => copyRecoveryCommands(h)}
+                              className="px-2 py-1 text-xs rounded-md border border-border hover:bg-accent transition-colors"
+                              title="Copy rollback commands"
+                            >
+                              {copiedJobId === h.job_id ? 'Copied' : 'Copy'}
+                            </button>
+                          </div>
+                        ) : (
+                          <span className="text-xs text-muted-foreground">—</span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })
+              ) : (
+                <tr>
+                  <td colSpan={8} className="px-3 py-6 text-center text-sm text-muted-foreground">
+                    {historyLoading ? 'Loading…' : 'No recent runs yet.'}
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </ConfigCard>
+    </ConfigSection>
+  );
+};
+
+export default UpdatesPage;

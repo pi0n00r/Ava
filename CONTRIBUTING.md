@@ -1,0 +1,172 @@
+# Contributing to Asterisk AI Voice Agent
+
+Thank you for your interest in contributing! All contributions are welcome — code, documentation, bug reports, tests, ideas, and feedback.
+
+By participating, you agree to our [Code of Conduct](CODE_OF_CONDUCT.md).
+
+## Why Contribute?
+
+**You don't need to know how to code.** Our AI assistant AVA writes the code for you.
+
+- **You know telephony better than most developers** — your Asterisk experience is rare and valuable
+- **AI does the coding** — any AI coding assistant (Claude, Cursor, Windsurf, Codex, Copilot, …) handles Python, React, Go — you just describe what you want
+- **Your server IS your test lab** — test features on your actual phone system with real calls
+- **One file to get your AI up to speed** — load [AVA.mdc](AVA.mdc) into your assistant; it carries the project map, guardrails, and workflow
+- **Get recognized** — your name in our Contributors list, release notes, and Discord
+- **Shape YOUR tool** — contribute features YOU actually need in your day-to-day operations
+
+**New to open source?** Start with [Developer Onboarding](docs/DEVELOPER_ONBOARDING.md) and the [Quick Start Guide](docs/contributing/quickstart.md), and ask in [Discord](https://discord.gg/ysg8fphxUe) #contributing — we're happy to walk you through your first PR.
+
+## What We're Looking For
+
+| Contribution Type | Examples | Good Starting Point? |
+|-------------------|----------|---------------------|
+| **Documentation** | Fix typos, improve guides, add examples | Yes |
+| **Tests** | Add unit tests, increase coverage (currently ~28%) | Yes |
+| **Bug fixes** | Fix reported issues | Yes |
+| **Tools** | New telephony or business tools (SMS, calendar, etc.) | Intermediate |
+| **Providers** | New STT/LLM/TTS pipeline adapters (Azure, Claude, etc.) | Intermediate |
+| **Admin UI** | Frontend features, accessibility, UX improvements | Intermediate |
+| **CLI** | New commands, help text improvements | Intermediate |
+| **CI/CD** | Workflow improvements, automated checks | Intermediate |
+
+## Finding Work
+
+- **Good first issues**: [GitHub Issues labeled `good first issue`](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues?q=label%3A%22good+first+issue%22)
+- **Help wanted**: [GitHub Issues labeled `help wanted`](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues?q=label%3A%22help+wanted%22)
+- **Roadmap**: See [docs/ROADMAP.md](docs/ROADMAP.md) for planned milestones with difficulty levels
+- **Discord**: Join [our server](https://discord.gg/ysg8fphxUe) and ask in #contributing
+
+### A note on `good first issue` tickets
+
+These are reserved for contributors making their first PR to AVA. If you've already had a PR merged — thank you — please pick up an issue without the `good first issue` label next time. This keeps the onboarding lane clear for people making their first contribution.
+
+## Getting Started
+
+**New to the project?** Start here:
+
+1. **[Developer Onboarding](docs/DEVELOPER_ONBOARDING.md)** - Project overview, directory map, first tasks
+2. **[Quick Start Guide](docs/contributing/quickstart.md)** - Set up your dev environment (15 min)
+3. **[Architecture Overview](docs/contributing/architecture-quickstart.md)** - Understand the system (10 min)
+4. **[Common Pitfalls](docs/contributing/COMMON_PITFALLS.md)** - Avoid these mistakes
+
+**For complete developer documentation**, see [docs/contributing/](docs/contributing/README.md).
+
+## Branches and Workflow
+
+Active branches:
+- `develop`: Feature work and ongoing development
+- `staging`: Release prep and GA readiness
+- `main`: Stable releases
+
+Recommended flow:
+
+1. Fork the repository and create a feature branch from the latest `main` — **one branch per PR** (never stack multiple PRs on the same branch; each PR should contain only its own commits)
+2. Make your changes in small, focused commits
+3. Open a Pull Request (PR) against `main`
+4. Include a clear description and testing notes
+5. A maintainer will review, run CI/manual checks, and merge
+
+Release candidates are staged on `staging` for golden baseline validation before being tagged from `main`.
+
+## Development Setup
+
+### Option A: AI-Assisted Setup (Recommended for Operators)
+
+```bash
+git clone https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk.git
+cd AVA-AI-Voice-Agent-for-Asterisk
+```
+
+Then open the folder in your AI coding assistant (Claude, Cursor, Windsurf, Codex, Copilot, …), load [AVA.mdc](AVA.mdc) as context, and tell it what you want to contribute — it knows the project map, guardrails, and PR workflow.
+
+### Option B: Traditional Setup (For Developers)
+
+```bash
+git clone https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk.git
+cd AVA-AI-Voice-Agent-for-Asterisk
+./install.sh   # guided setup; or follow README for manual steps
+```
+
+For Local/Hybrid profiles, run `make model-setup` when prompted to download models.
+
+## Code Style & Quality
+
+- Python: target 3.10+. Keep code readable and well-logged.
+- Prefer small, composable functions and clear error handling.
+- Add or update documentation where behavior changes.
+- See [code-style.md](docs/contributing/code-style.md) for details.
+
+## Tests & Verification
+
+```bash
+# Run Python tests
+pytest tests/ -v
+
+# Verify health
+curl http://127.0.0.1:15000/health
+
+# Full diagnostics
+agent check
+```
+
+See [testing-guide.md](docs/contributing/testing-guide.md) for more detail.
+
+## Commit Messages
+
+- Use clear, descriptive messages (Conventional Commits encouraged but not required)
+- Reference related issues where applicable (e.g., `Fixes #123`)
+
+## Proposing Features
+
+For new features or significant changes:
+
+1. Open a [GitHub Discussion](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/discussions) in "Ideas"
+2. If accepted, create a milestone spec using the [template](docs/contributing/milestones/TEMPLATE.md)
+3. Submit as a Draft PR for review
+
+See [GOVERNANCE.md](GOVERNANCE.md) for the full decision-making process.
+
+## Review Expectations
+
+- PRs are typically reviewed within a few days
+- The maintainer may request changes or suggest a different approach
+- CI must pass before merge
+- Documentation updates are expected for behavior changes
+
+## Reporting Issues
+
+Use [GitHub Issues](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues) with:
+- Steps to reproduce
+- Relevant logs (`agent check`, `agent rca`)
+- Environment details (OS, Docker version, Asterisk version)
+- Redacted config if relevant
+
+## Issue Labels
+
+We use labels to categorize issues:
+
+| Label | Description |
+|-------|-------------|
+| `good first issue` | Good for newcomers — [first-PR policy](#a-note-on-good-first-issue-tickets) |
+| `help wanted` | Extra attention needed |
+| `difficulty: beginner` | No Asterisk experience needed |
+| `difficulty: intermediate` | Some domain knowledge needed |
+| `difficulty: advanced` | Deep telephony/provider knowledge |
+| `area: docs` | Documentation |
+| `area: admin-ui` | Admin UI (React/TypeScript) |
+| `area: engine` | Core Python engine |
+| `area: cli` | Go CLI tool |
+| `area: providers` | Provider integrations |
+| `area: tools` | Tool calling system |
+| `area: local-ai` | Local AI server |
+
+## File Naming Conventions
+
+- Operator-facing docs: `UPPER_SNAKE.md` (e.g., `ADMIN_UI_GUIDE.md`)
+- Reference/setup docs: `Title-Case-Hyphens.md` (e.g., `Provider-Azure-Setup.md`)
+- Don't rename existing files (breaks external links)
+
+---
+
+Thanks again for helping improve the project!

@@ -1,0 +1,1751 @@
+"""
+Shared Configuration System for Asterisk AI Voice Agent v2.0
+
+This module provides centralized configuration management for all microservices
+using Pydantic v2 for validation and type safety.
+"""
+
+import os
+import yaml
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    field_validator,
+    model_validator,
+)
+from typing import Dict, Any, Literal, Optional, List
+import re
+import structlog
+
+from src.utils.diagnostic_paths import DEFAULT_DIAGNOSTIC_TAP_DIR
+
+# Import configuration helpers (AAVA-40 refactor)
+from src.config.loaders import resolve_config_path, load_yaml_with_env_expansion, load_yaml_with_local_override
+from src.config.security import (
+    inject_asterisk_credentials,
+    inject_llm_config,
+    inject_provider_api_keys,
+)
+from src.config.provider_instances import full_agent_default
+from src.config.defaults import (
+    apply_transport_defaults,
+    apply_audiosocket_defaults,
+    apply_externalmedia_defaults,
+    apply_diagnostic_defaults,
+    apply_barge_in_defaults,
+)
+from src.config.normalization import (
+    normalize_legacy_openai_audio,
+    normalize_local_provider_tokens,
+    normalize_pipelines,
+    normalize_profiles,
+)
+
+logger = structlog.get_logger(__name__)
+
+# Determine the absolute path to the project root from this file's location
+# This makes the config loading independent of the current working directory.
+_PROJ_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+class AsteriskConfig(BaseModel):
+    host: str
+    port: int = Field(default=8088)
+    scheme: str = Field(default="http")  # http or https (https uses wss:// for WebSocket)
+    ssl_verify: bool = Field(default=True)  # Set to False to skip SSL certificate verification
+    username: str
+    password: str
+    app_name: str = Field(default="asterisk-ai-voice-agent")
+    # ARI is the engine's call-control ownership channel. Keepalive defaults
+    # bound a silent packet-drop to roughly interval + timeout (20 seconds)
+    # before /ready fails and the reconnect supervisor takes over.
+    ws_ping_interval_sec: float = Field(default=10.0, ge=5.0, le=60.0)
+    ws_ping_timeout_sec: float = Field(default=10.0, ge=5.0, le=60.0)
+
+class ExternalMediaConfig(BaseModel):
+    # Network configuration
+    rtp_host: str = Field(default="127.0.0.1")  # Bind host: IP the RTP server listens on
+    advertise_host: Optional[str] = Field(default=None)  # Advertise host: IP Asterisk sends RTP to (defaults to rtp_host if not set)
+    rtp_port: int = Field(default=18080)
+    port_range: Optional[str] = Field(default=None)
+    
+    # Asterisk-side configuration (RTP payload)
+    codec: str = Field(default="ulaw")  # Asterisk channel codec: ulaw, alaw, slin, slin16
+    direction: str = Field(default="both")  # RTP direction: both, sendonly, recvonly
+    
+    # Engine-side configuration (internal processing)
+    # Defines how RTP server delivers audio to engine/providers
+    format: str = Field(default="slin16")  # Engine internal format: slin (8kHz), slin16 (16kHz), ulaw (8kHz)
+    sample_rate: Optional[int] = Field(default=None)  # Optional: inferred from format if not set (8000 or 16000)
+    
+    # Note: jitter_buffer_ms removed - RTP has built-in buffering, not configurable
+    # streaming.jitter_buffer_ms controls StreamingPlaybackManager buffering instead
+
+    # Security / deployment hardening:
+    # - If set, only accept inbound RTP packets from these source IPs/hosts.
+    # - If lock_remote_endpoint is True, do not update remote endpoint mid-call.
+    allowed_remote_hosts: Optional[List[str]] = Field(default=None)
+    lock_remote_endpoint: bool = Field(default=True)
+
+
+class AudioSocketConfig(BaseModel):
+    host: str = Field(default="127.0.0.1")  # Bind host: IP the AudioSocket server listens on
+    advertise_host: Optional[str] = Field(default=None)  # Advertise host: IP Asterisk connects to (defaults to host if not set)
+    port: int = Field(default=8090)
+    format: str = Field(default="ulaw")  # 'ulaw' or 'slin16'
+
+
+class LocalProviderConfig(BaseModel):
+    enabled: bool = Field(default=True)
+    # base_url is preferred for full agent mode (consistent with other providers)
+    # ws_url is kept for backward compatibility with modular providers
+    base_url: Optional[str] = Field(default=None)
+    ws_url: Optional[str] = Field(default="ws://127.0.0.1:8765")
+    # Optional WS auth token for local-ai-server.
+    auth_token: Optional[str] = None
+    connect_timeout_sec: float = Field(default=5.0)
+    response_timeout_sec: float = Field(default=5.0)
+    # Per-call TTS egress target. Audio profiles override these on call-owned
+    # provider instances; defaults preserve the historical Local AI contract.
+    target_encoding: str = Field(default="mulaw")
+    target_sample_rate_hz: int = Field(default=8000)
+    # MED-R3: max total wall-time the mid-call background reconnect will keep
+    # retrying after the Local AI Server WebSocket drops mid-call. While retrying,
+    # inbound caller audio is dropped (the caller hears silence), so this bounds
+    # that mute window. On exceed, the provider stops retrying and signals the
+    # engine (ProviderDisconnected) to play an apology and hang up.
+    mid_call_reconnect_timeout_sec: int = Field(default=20)
+    # Farewell mode: how to play goodbye message when call ends
+    # "tts" - Use local TTS (best for fast hardware with <5s LLM response)
+    # "asterisk" - Use Asterisk's built-in goodbye sound (reliable for slow hardware)
+    farewell_mode: str = Field(default="asterisk")
+    # Farewell TTS timeout - how long to wait for goodbye TTS before hanging up
+    # Only used when farewell_mode="tts"
+    # Set based on your hardware speed (see LLM warmup time in logs)
+    # Fast hardware: 5-10s, Slow hardware: 30-60s
+    farewell_timeout_sec: float = Field(default=30.0)
+    # Farewell hangup delay - seconds to wait after farewell audio completes before hangup
+    # Ensures farewell message fully plays through RTP pipeline before disconnecting
+    # Increase if farewell gets cut off (typical farewells need 2-4 seconds)
+    farewell_hangup_delay_sec: float = Field(default=5.0)
+    # Local tool-call handling policy:
+    # - auto: derive from local_ai_server LLM capability probe
+    # - strict: enforce full structured tool instructions
+    # - compatible: compact instructions + parser recovery
+    # - off: disable prompt injection for tools
+    tool_call_policy: str = Field(default="auto")
+    # Structured tool gateway for full-local provider. Keeps modular local STT/TTS paths unchanged.
+    tool_gateway_enabled: bool = Field(default=True)
+    chunk_ms: int = Field(default=200)
+    max_tokens: int = Field(default=150)
+    temperature: float = Field(default=0.4)
+    llm_model: Optional[str] = None
+    greeting: Optional[str] = None
+    instructions: Optional[str] = None
+    # Mode for local_ai_server: "full" (STT+LLM+TTS), "stt" (STT only for hybrid pipelines)
+    mode: str = Field(default="full")
+    
+    # STT Backend selection: vosk | kroko | sherpa
+    stt_backend: str = Field(default="vosk")
+    # Vosk STT model path
+    stt_model: Optional[str] = None
+    # Kroko STT settings
+    kroko_url: Optional[str] = Field(default="wss://app.kroko.ai/api/v1/transcripts/streaming")
+    kroko_api_key: Optional[str] = None
+    kroko_language: str = Field(default="en-US")
+    # Sherpa-ONNX STT model path
+    sherpa_model_path: Optional[str] = None
+    
+    # TTS Backend selection: piper | kokoro
+    tts_backend: str = Field(default="piper")
+    # Piper TTS voice/model path
+    tts_voice: Optional[str] = None
+    # Kokoro TTS settings
+    kokoro_voice: str = Field(default="af_heart")
+    kokoro_lang: str = Field(default="a")
+    kokoro_model_path: Optional[str] = None
+    
+    @property
+    def effective_ws_url(self) -> str:
+        """Return base_url if set, otherwise ws_url."""
+        return self.base_url or self.ws_url or "ws://127.0.0.1:8765"
+
+
+class DeepgramProviderConfig(BaseModel):
+    api_key: Optional[str] = None
+    api_key_file: Optional[str] = None
+    api_key_env: Optional[str] = None
+    type: Optional[str] = None
+    display_name: Optional[str] = None
+    customer: Optional[str] = None
+    enabled: bool = Field(default=True)
+    # The Deepgram Voice Agent's listen-provider model. Pre-v6.5.0 the listen
+    # model was hardcoded to "nova-3" in src/providers/deepgram.py regardless
+    # of this config, so the effective production default has been "nova-3"
+    # for some time. v6.5.0 made the listen model honor this config — and we
+    # set the default here to "nova-3" to preserve that effective behavior on
+    # upgrade. Operators wanting Flux's conversational EOT VAD should pick
+    # "flux-general-en" (English) or "flux-general-multi" via the Admin UI
+    # dropdown; the provider will add `version: "v2"` and Flux-specific
+    # tuning fields automatically.
+    model: str = Field(default="nova-3")
+    tts_model: str = Field(default="aura-asteria-en")
+    # Flux-specific tuning. Only sent in the Settings JSON when the chosen
+    # `model` starts with "flux". Defaults match Deepgram's recommendations
+    # (eot_threshold=0.7, eager_eot_threshold disabled by default).
+    # Valid ranges enforced below, per Deepgram's Configure Voice Agent docs
+    # (https://developers.deepgram.com/docs/configure-voice-agent):
+    #   eot_threshold:       0.5 – 0.9
+    #   eager_eot_threshold: 0.3 – 0.9 (or None to disable)
+    # Cross-field rule (also enforced): if both are set, the eager threshold
+    # must be lower than the final eot threshold; otherwise eager EOT
+    # detection becomes a no-op or misbehaves.
+    eot_threshold: Optional[float] = Field(default=0.7, ge=0.5, le=0.9)
+    eager_eot_threshold: Optional[float] = Field(default=None, ge=0.3, le=0.9)
+    # Flux end-of-turn timeout in milliseconds: how long Flux waits after the
+    # last speech before forcing an end-of-turn. Read by the Flux adapter
+    # (src/pipelines/deepgram_flux.py); the default mirrors the adapter's
+    # historical hardcoded fallback of 5000ms (audit LOW-P6).
+    eot_timeout_ms: int = Field(default=5000)
+    keyterms: Optional[List[str]] = Field(default=None)
+    greeting: Optional[str] = None
+    instructions: Optional[str] = None
+    input_encoding: str = Field(default="mulaw")
+    input_sample_rate_hz: int = Field(default=8000)
+    input_gain_target_rms: int = Field(default=0)
+    input_gain_max_db: float = Field(default=0.0)
+    continuous_input: bool = Field(default=True)
+    output_encoding: str = Field(default="mulaw")
+    output_sample_rate_hz: int = Field(default=8000)
+    output_resampler: Literal["inherit", "linear", "bandlimited"] = Field(default="inherit")
+    allow_output_autodetect: bool = Field(default=False)
+    base_url: str = Field(default="https://api.deepgram.com")
+    tts_voice: Optional[str] = None
+    stt_language: str = Field(default="en-US")
+    # Deepgram Voice Agent language (full-agent mode only). AAVA's verified
+    # end-to-end Aura surface is en/es/de/fr/it/nl/ja; existing BCP-47 locale
+    # variants are normalized to their base language by the provider.
+    agent_language: str = Field(default="en")
+    # Deepgram Voice Agent (monolithic) WebSocket endpoint
+    voice_agent_base_url: str = Field(
+        default="wss://agent.deepgram.com/v1/agent/converse"
+    )
+    # Provider-specific farewell hangup delay (overrides global)
+    farewell_hangup_delay_sec: Optional[float] = None
+
+    @model_validator(mode="after")
+    def _validate_flux_thresholds(self) -> "DeepgramProviderConfig":
+        """Cross-field check for Flux EOT thresholds.
+
+        Per Deepgram's Voice Agent docs, eager EOT detection only behaves
+        correctly when its threshold is strictly lower than the final EOT
+        threshold (the eager VAD fires on a lower-confidence preview, then
+        the final EOT fires on a higher-confidence confirmation). If both
+        are configured but eager >= final, the eager VAD is at best a no-op
+        and at worst confuses turn-taking — better to fail fast at config
+        load.
+        """
+        if self.eot_threshold is not None and self.eager_eot_threshold is not None:
+            if self.eager_eot_threshold >= self.eot_threshold:
+                raise ValueError(
+                    "Deepgram Flux: eager_eot_threshold "
+                    f"({self.eager_eot_threshold}) must be strictly less than "
+                    f"eot_threshold ({self.eot_threshold}). "
+                    "Eager EOT detection only fires on a lower-confidence "
+                    "preview before the final higher-confidence EOT confirmation."
+                )
+        return self
+
+
+class OpenAIProviderConfig(BaseModel):
+    """# Milestone7: Canonical defaults for OpenAI pipeline adapters."""
+    api_key: Optional[str] = None
+    organization: Optional[str] = None
+    project: Optional[str] = None
+    tools_enabled: bool = Field(default=True)
+    # "ga" = GA Realtime API (no beta header, gpt-realtime model family) — DEFAULT
+    # "beta" = Beta Realtime API (OpenAI-Beta header, gpt-4o-realtime-preview models)
+    # OpenAI sunset the Beta Realtime API on 2026-05-12 and removed the
+    # gpt-4o-realtime-preview-* model snapshots on 2026-05-07. Beta is retained
+    # as a config knob for forward-compat / debugging only; setting it now
+    # produces a one-shot warning and OpenAI rejects the WebSocket with
+    # beta_api_shape_disabled. See docs/MIGRATION.md and the v6.5.3 hotfix.
+    api_version: str = Field(default="ga")
+    realtime_base_url: str = Field(default="wss://api.openai.com/v1/realtime")
+    chat_base_url: str = Field(default="https://api.openai.com/v1")
+    stt_base_url: str = Field(default="https://api.openai.com/v1/audio/transcriptions")
+    tts_base_url: str = Field(default="https://api.openai.com/v1/audio/speech")
+    # Current GA Realtime models (verified against OpenAI's official docs):
+    #   gpt-realtime        — stable conversational (default; what v6.5.3 hotfix flipped to)
+    #   gpt-realtime-1.5    — best audio-in/audio-out quality
+    #   gpt-realtime-2      — reasoning voice model with configurable effort
+    #   gpt-realtime-mini   — cost-optimized
+    realtime_model: str = Field(default="gpt-realtime")
+    chat_model: str = Field(default="gpt-4o-mini")
+    stt_model: str = Field(default="whisper-1")
+    # NOTE: Default to widely-available TTS model to avoid silent-call failures when
+    # accounts don't have access to newer/limited models.
+    tts_model: str = Field(default="tts-1")
+    voice: str = Field(default="alloy")
+    tts_response_format: str = Field(default="wav")
+    default_modalities: List[str] = Field(default_factory=lambda: ["text"])
+    input_encoding: str = Field(default="linear16")
+    input_sample_rate_hz: int = Field(default=24000)
+    target_encoding: str = Field(default="mulaw")
+    target_sample_rate_hz: int = Field(default=8000)
+    output_resampler: Literal["inherit", "linear", "bandlimited"] = Field(default="inherit")
+    chunk_size_ms: int = Field(default=20)
+    response_timeout_sec: float = Field(default=5.0)
+    # Provider-specific farewell hangup delay (overrides global)
+    farewell_hangup_delay_sec: Optional[float] = None
+
+
+class TelnyxLLMProviderConfig(BaseModel):
+    """
+    Canonical defaults for the Telnyx AI Inference LLM adapter.
+
+    Notes:
+    - Telnyx-hosted models (e.g. meta-llama/*) work with TELNYX_API_KEY only.
+    - External models (e.g. openai/*) require an Integration Secret identifier
+      passed via `api_key_ref` (see Telnyx docs for "Integration Secrets").
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    api_key: Optional[str] = None
+    api_key_ref: Optional[str] = None
+
+    chat_base_url: str = Field(default="https://api.telnyx.com/v2/ai")
+    # Default to a model that supports tool calling reliably on Telnyx.
+    chat_model: str = Field(default="Qwen/Qwen3-235B-A22B")
+
+    temperature: float = Field(default=0.7)
+    max_tokens: Optional[int] = None
+    # Telnyx-hosted models can be slower than OpenAI; keep a more forgiving default.
+    response_timeout_sec: float = Field(default=30.0)
+
+
+class MiniMaxLLMProviderConfig(BaseModel):
+    """
+    Canonical defaults for the MiniMax LLM pipeline adapter.
+
+    MiniMax exposes an OpenAI-compatible Chat Completions endpoint.
+    Supported models: MiniMax-M3 (default), MiniMax-M2.7,
+    MiniMax-M2.7-highspeed.
+
+    Key constraints:
+      - temperature must be in (0.0, 1.0]; 0 is rejected.
+      - response_format is NOT supported; omit it.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    api_key: Optional[str] = None
+
+    chat_base_url: str = Field(default="https://api.minimax.io/v1")
+    chat_model: str = Field(default="MiniMax-M3")
+
+    temperature: float = Field(default=1.0)
+    max_tokens: Optional[int] = None
+    response_timeout_sec: float = Field(default=30.0)
+
+
+class GoogleProviderConfig(BaseModel):
+    api_key: Optional[str] = None
+    api_key_file: Optional[str] = None
+    api_key_env: Optional[str] = None
+    credentials_path: Optional[str] = None
+    type: Optional[str] = None
+    display_name: Optional[str] = None
+    customer: Optional[str] = None
+    # NOTE: not read by any adapter (audit LOW-P9)
+    project_id: Optional[str] = None
+    stt_base_url: str = Field(default="https://speech.googleapis.com/v1")
+    tts_base_url: str = Field(default="https://texttospeech.googleapis.com/v1")
+    llm_base_url: str = Field(default="https://generativelanguage.googleapis.com/v1")
+    stt_language_code: str = Field(default="en-US")
+    tts_voice_name: str = Field(default="en-US-Neural2-C")
+    tts_audio_encoding: str = Field(default="MULAW")
+    tts_sample_rate_hz: int = Field(default=8000)
+    llm_model: str = Field(default="models/gemini-1.5-pro-latest")
+    greeting: Optional[str] = None  # For Google Live API initial greeting
+    instructions: Optional[str] = None  # System prompt/instructions for Google Live API
+    enabled: bool = Field(default=True)  # Provider enabled flag
+    
+    # Google Live LLM generation configuration
+    llm_temperature: float = Field(default=0.7, ge=0.0, le=2.0)  # Temperature for response generation
+    llm_max_output_tokens: int = Field(default=8192, ge=1, le=8192)  # Max output tokens (Gemini supports up to 8192)
+    llm_top_p: float = Field(default=0.95, ge=0.0, le=1.0)  # Nucleus sampling parameter
+    llm_top_k: int = Field(default=40, ge=1, le=100)  # Top-k sampling parameter
+
+    # Google Live VAD / turn-taking tuning (MED-P3). Previously read via getattr with
+    # these same defaults but absent from the model, so they were untunable; declare
+    # them so YAML/UI values are honored.
+    vad_end_of_speech_sensitivity: Optional[str] = Field(default="END_SENSITIVITY_HIGH")
+    vad_start_of_speech_sensitivity: Optional[str] = Field(default="START_SENSITIVITY_HIGH")
+    vad_prefix_padding_ms: int = Field(default=20, ge=0)
+    vad_silence_duration_ms: int = Field(default=500, ge=0)
+
+    # Google Live response configuration
+    response_modalities: str = Field(default="audio")  # "audio", "text", or "audio_text"
+    
+    # Google Live transcription configuration (for email summaries/conversation history)
+    enable_input_transcription: bool = Field(default=True)  # Enable user speech transcription
+    enable_output_transcription: bool = Field(default=True)  # Enable AI speech transcription
+    
+    # Google Live audio format configuration (aligns with OpenAI Realtime pattern)
+    input_encoding: str = Field(default="ulaw")  # Wire format from AudioSocket/RTP (ulaw/slin16)
+    input_sample_rate_hz: int = Field(default=8000)  # Wire sample rate
+    provider_input_encoding: str = Field(default="linear16")  # Gemini Live expects PCM16
+    provider_input_sample_rate_hz: int = Field(default=16000)  # Gemini Live input rate
+    input_gain_target_rms: int = Field(default=0)
+    input_gain_max_db: float = Field(default=0.0)
+    output_encoding: str = Field(default="linear16")  # Gemini Live outputs PCM16
+    output_sample_rate_hz: int = Field(default=24000)  # Gemini Live native output rate
+    output_resampler: Literal["inherit", "linear", "bandlimited"] = Field(default="inherit")
+    target_encoding: str = Field(default="ulaw")  # Target wire format for playback
+    target_sample_rate_hz: int = Field(default=8000)  # Target wire sample rate
+    # Google Live WebSocket endpoint (monolithic agent)
+    websocket_endpoint: str = Field(
+        default="wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+    )
+    # Provider-specific farewell hangup delay (overrides global)
+    farewell_hangup_delay_sec: Optional[float] = None
+    # Fallback watchdog tuning (Google Live only)
+    hangup_fallback_audio_idle_sec: float = Field(default=1.25)
+    hangup_fallback_min_armed_sec: float = Field(default=0.8)
+    hangup_fallback_no_audio_timeout_sec: float = Field(default=4.0)
+    # Guard against premature fallback hangup before the provider emits turnComplete.
+    # If turnComplete never arrives, fallback still proceeds after this timeout.
+    hangup_fallback_turn_complete_timeout_sec: float = Field(default=2.5)
+    # Google Live only: heuristic hangup detection based on transcript markers (end_call / assistant_farewell).
+    # For production, prefer tool-driven hangup (`hangup_call`) to avoid marker-driven premature cleanup.
+    hangup_markers_enabled: bool = Field(default=False)
+    # Google Live only: protocol-level WebSocket ping keepalive.
+    # NOTE: Google Live typically receives continuous `realtimeInput` audio frames; pings are only needed
+    # if the transport becomes idle. Some accounts/models appear to close connections (1008) after repeated
+    # ping frames, so we default to pinging only when idle (see provider implementation).
+    ws_keepalive_enabled: bool = Field(default=False)
+    ws_keepalive_interval_sec: float = Field(default=15.0)
+    ws_keepalive_idle_sec: float = Field(default=5.0)
+
+    # Google Vertex AI Live API support (AAVA-191)
+    # When use_vertex_ai=True, the provider connects to Vertex AI instead of the Developer API.
+    # Vertex AI uses OAuth2/ADC (Application Default Credentials) instead of an API key.
+    # Requires: GOOGLE_APPLICATION_CREDENTIALS or gcloud auth application-default login
+    # Vertex AI GA models fix the function calling 1008 bug present in Developer API preview models.
+    use_vertex_ai: bool = Field(default=False)
+    vertex_project: Optional[str] = None  # GCP project ID (GOOGLE_CLOUD_PROJECT)
+    vertex_location: str = Field(default="us-central1")  # GCP region (GOOGLE_CLOUD_LOCATION)
+
+
+class GroqSTTProviderConfig(BaseModel):
+    """Groq Speech-to-Text (OpenAI-compatible audio/transcriptions + audio/translations)."""
+
+    enabled: bool = Field(default=True)
+    api_key: Optional[str] = None
+    stt_base_url: str = Field(default="https://api.groq.com/openai/v1/audio/transcriptions")
+    # Groq STT supported models: whisper-large-v3-turbo, whisper-large-v3
+    stt_model: str = Field(default="whisper-large-v3-turbo")
+    language: Optional[str] = None  # ISO-639-1 (e.g., en, tr)
+    prompt: Optional[str] = None
+    response_format: str = Field(default="json")  # json | verbose_json | text
+    temperature: float = Field(default=0.0, ge=0.0, le=1.0)
+    timestamp_granularities: Optional[List[str]] = None  # ["segment"] and/or ["word"] (requires verbose_json)
+    request_timeout_sec: float = Field(default=15.0)
+
+
+class GroqTTSProviderConfig(BaseModel):
+    """Groq Text-to-Speech (OpenAI-compatible audio/speech; Orpheus models)."""
+
+    enabled: bool = Field(default=True)
+    api_key: Optional[str] = None
+    tts_base_url: str = Field(default="https://api.groq.com/openai/v1/audio/speech")
+    # Groq TTS supported models: canopylabs/orpheus-v1-english, canopylabs/orpheus-arabic-saudi
+    tts_model: str = Field(default="canopylabs/orpheus-v1-english")
+    voice: str = Field(default="hannah")
+    response_format: str = Field(default="wav")  # Orpheus docs: only supported response_format is wav.
+    # Orpheus docs: input max 200 characters; adapter should chunk longer strings.
+    max_input_chars: int = Field(default=200, ge=1)
+    # Output format expected by downstream playback
+    target_encoding: str = Field(default="mulaw")
+    target_sample_rate_hz: int = Field(default=8000)
+    output_resampler: Literal["inherit", "linear", "bandlimited"] = Field(default="inherit")
+    chunk_size_ms: int = Field(default=20)
+    request_timeout_sec: float = Field(default=15.0)
+
+
+class ElevenLabsProviderConfig(BaseModel):
+    """ElevenLabs TTS provider configuration.
+
+    API Reference: https://elevenlabs.io/docs/api-reference/text-to-speech
+    """
+    enabled: bool = Field(default=True)
+    api_key: Optional[str] = None
+    # Default voice: Rachel (warm, professional)
+    voice_id: str = Field(default="21m00Tcm4TlvDq8ikWAM")
+    model_id: str = Field(default="eleven_turbo_v2_5")  # Fast, high-quality
+    base_url: str = Field(default="https://api.elevenlabs.io/v1")
+    # Audio settings
+    output_format: str = Field(default="ulaw_8000")  # ulaw_8000, mp3_44100, pcm_16000, etc.
+    output_resampler: Literal["inherit", "linear", "bandlimited"] = Field(default="inherit")
+    # Voice settings
+    stability: float = Field(default=0.5)
+    similarity_boost: float = Field(default=0.75)
+    style: float = Field(default=0.0)
+    use_speaker_boost: bool = Field(default=True)
+    # Provider-specific farewell hangup delay (overrides global)
+    farewell_hangup_delay_sec: Optional[float] = None
+
+
+class CambAiProviderConfig(BaseModel):
+    """CAMB AI TTS provider configuration.
+
+    Supports MARS speech models: mars-flash (~150ms latency),
+    mars-pro (higher quality), mars-instruct (director-level control).
+
+    API Reference: https://docs.camb.ai
+    """
+    enabled: bool = Field(default=True)
+    api_key: Optional[str] = None
+    voice_id: int = Field(default=147320)  # Default CAMB AI voice
+    speech_model: str = Field(default="mars-flash")  # mars-flash, mars-pro, mars-instruct
+    language: str = Field(default="en-us")  # BCP-47 language code
+    base_url: str = Field(default="https://client.camb.ai/apis")
+    # Output format for streaming TTS
+    output_format: str = Field(default="pcm_s16le")  # pcm_s16le for raw PCM
+    output_resampler: Literal["inherit", "linear", "bandlimited"] = Field(default="inherit")
+    # Provider-specific farewell hangup delay (overrides global)
+    farewell_hangup_delay_sec: Optional[float] = None
+
+
+_AZURE_REGION_RE = re.compile(r"^[a-z][a-z0-9-]{0,48}[a-z0-9]$")
+
+
+def validate_azure_region(region: str) -> str:
+    """Validate and normalise an Azure region string.
+
+    Azure regions are lowercase alphanumeric with hyphens (e.g. ``eastus``,
+    ``west-europe``).  Passing unsanitised user input directly into URL
+    templates is an SSRF risk, so this function rejects anything that does
+    not match the expected pattern.
+
+    Returns the stripped, lowered region on success.
+    Raises ``ValueError`` on invalid input.
+    """
+    cleaned = region.strip().lower()
+    if not cleaned or not _AZURE_REGION_RE.match(cleaned):
+        raise ValueError(
+            f"Invalid Azure region '{region}'. "
+            "Expected lowercase alphanumeric with optional hyphens (e.g. 'eastus', 'westeurope')."
+        )
+    return cleaned
+
+
+class AzureSTTProviderConfig(BaseModel):
+    """Microsoft Azure Speech Service - Speech-to-Text provider configuration.
+
+    Supports two variants:
+    - 'fast': Azure Fast Transcription API (multipart POST, lower latency)
+    - 'realtime': Azure Real-Time STT REST API (binary WAV POST)
+
+    API docs:
+      Fast:     https://learn.microsoft.com/azure/ai-services/speech-service/fast-transcription-create
+      Realtime: https://learn.microsoft.com/azure/ai-services/speech-service/how-to-recognize-speech?pivots=programming-language-rest
+    """
+
+    enabled: bool = Field(default=True)
+    api_key: Optional[str] = None
+    # Azure region, e.g. "eastus", "westeurope". Used to auto-build endpoint URLs.
+    region: str = Field(default="eastus")
+    # Override the fast transcription endpoint URL (defaults to region-derived URL)
+    fast_stt_base_url: Optional[str] = Field(default=None)
+    # Override the real-time STT endpoint URL (defaults to region-derived URL)
+    realtime_stt_base_url: Optional[str] = Field(default=None)
+    # BCP-47 locale, e.g. "en-US", "es-ES"
+    language: str = Field(default="en-US")
+    # Which variant the 'azure_stt' alias resolves to: "fast" | "realtime"
+    variant: Literal["realtime", "fast"] = Field(default="realtime")
+
+    @field_validator("region")
+    @classmethod
+    def _validate_region(cls, v: str) -> str:
+        return validate_azure_region(v)
+    # API version for Fast Transcription
+    api_version: str = Field(default="2024-11-15")
+    request_timeout_sec: float = Field(default=15.0)
+    # VAD end silence timeout for Realtime streaming in milliseconds
+    vad_silence_timeout_ms: int = Field(default=300)
+    # VAD initial silence timeout for Realtime streaming in milliseconds
+    vad_initial_silence_timeout_ms: int = Field(default=5000)
+
+
+class AzureTTSProviderConfig(BaseModel):
+    """Microsoft Azure Speech Service - Text-to-Speech provider configuration.
+
+    Uses SSML POST to the Azure TTS REST endpoint.
+
+    API docs:
+      https://learn.microsoft.com/azure/ai-services/speech-service/get-started-text-to-speech?pivots=programming-language-rest
+    """
+
+    enabled: bool = Field(default=True)
+    api_key: Optional[str] = None
+    # Azure region, e.g. "eastus", "westeurope"
+    region: str = Field(default="eastus")
+    # Override the TTS endpoint URL (defaults to region-derived URL)
+    tts_base_url: Optional[str] = Field(default=None)
+    # Neural voice name, e.g. "en-US-JennyNeural", "es-ES-AlvaroNeural"
+    voice_name: str = Field(default="en-US-JennyNeural")
+    # Base language for xml:lang on <speak> element.
+    # If None, auto-derived from voice name (e.g. "en-US-JennyNeural" → "en-US").
+    language: Optional[str] = Field(default=None)
+    # Target language for SSML <lang xml:lang="..."> element.
+    # Use this for multilingual voices to specify the spoken language of the text,
+    # e.g. "es-MX" when using a Chinese multilingual voice to speak Spanish.
+    # When set, SSML becomes: <voice><lang xml:lang="lang_tag">text</lang></voice>
+    lang_tag: Optional[str] = Field(default=None)
+    # Override for global downstream_mode setting (how audio is played toward Asterisk).
+    # "auto"   → use the global downstream_mode (default, preserves existing behaviour)
+    # "stream" → force streaming playback via StreamingPlaybackManager, regardless of global mode
+    # "file"   → force file-based playback, regardless of global mode
+    # Useful when you want Azure TTS streaming (chunked HTTP) but file-based Asterisk playback,
+    # or when you want streaming Asterisk playback even if downstream_mode=file globally.
+    # NOTE: not read by any adapter (audit LOW-P9) — the Azure TTS adapter computes
+    # its own downstream_mode_override from streaming settings (src/pipelines/azure.py).
+    downstream_mode_override: str = Field(default="auto")
+    # Azure output audio format header value (X-Microsoft-OutputFormat).
+    # PCM-based formats (riff-*) are decoded natively; raw-8khz-mulaw is used directly.
+    # See: https://learn.microsoft.com/azure/ai-services/speech-service/rest-text-to-speech
+    output_format: str = Field(default="raw-8khz-16bit-mono-pcm")
+    # Downstream encoding the engine expects (ulaw | pcm | slin16)
+    target_encoding: str = Field(default="mulaw")
+    target_sample_rate_hz: int = Field(default=8000)
+    output_resampler: Literal["inherit", "linear", "bandlimited"] = Field(default="inherit")
+    chunk_size_ms: int = Field(default=20)
+    request_timeout_sec: float = Field(default=15.0)
+    # Streaming: read response in chunks as they arrive instead of waiting for
+    # the full audio. Reduces time-to-first-audio-chunk significantly.
+    streaming: bool = Field(default=True)
+    # SSML prosody controls (applied via <prosody> tag in generated SSML)
+    # pitch: relative shift e.g. "+10%", "-5%", "high", "low", "default"
+    prosody_pitch: Optional[str] = Field(default=None)
+    # rate: speaking speed e.g. "slow", "medium", "fast", "+20%", "0.8"
+    prosody_rate: Optional[str] = Field(default=None)
+
+    @field_validator("region")
+    @classmethod
+    def _validate_region(cls, v: str) -> str:
+        return validate_azure_region(v)
+
+
+class MCPToolConfig(BaseModel):
+    """Configuration for a single MCP-backed tool exposed to the LLM."""
+
+    name: str
+    expose_as: Optional[str] = None  # Provider-safe name (e.g., mcp_weather_get_forecast)
+    description: Optional[str] = None
+
+    # Voice UX
+    speech_field: Optional[str] = None
+    speech_template: Optional[str] = None
+
+    # Timing / UX
+    timeout_ms: Optional[int] = None
+    slow_response_threshold_ms: Optional[int] = None
+    slow_response_message: Optional[str] = None
+
+
+class MCPServerRestartConfig(BaseModel):
+    enabled: bool = Field(default=True)
+    max_restarts: int = Field(default=5, ge=0)
+    backoff_ms: int = Field(default=1000, ge=0)
+
+
+class MCPServerDefaultsConfig(BaseModel):
+    timeout_ms: int = Field(default=10000, ge=1)
+    slow_response_threshold_ms: int = Field(default=0, ge=0)
+    slow_response_message: str = Field(default="Let me look that up for you, one moment...")
+
+
+class MCPServerConfig(BaseModel):
+    """Configuration for a single MCP server."""
+
+    enabled: bool = Field(default=True)
+    transport: str = Field(default="stdio")  # currently: stdio
+    command: List[str] = Field(default_factory=list)  # e.g., ["python3", "-m", "my_mcp_server"]
+    cwd: Optional[str] = None
+    env: Dict[str, str] = Field(default_factory=dict)
+    restart: MCPServerRestartConfig = Field(default_factory=MCPServerRestartConfig)
+    defaults: MCPServerDefaultsConfig = Field(default_factory=MCPServerDefaultsConfig)
+    tools: List[MCPToolConfig] = Field(default_factory=list)  # optional allowlist; if empty => expose all discovered
+
+
+class MCPConfig(BaseModel):
+    enabled: bool = Field(default=False)
+    servers: Dict[str, MCPServerConfig] = Field(default_factory=dict)
+
+
+class OpenAIRealtimeProviderConfig(BaseModel):
+    enabled: bool = Field(default=True)
+    api_key: Optional[str] = None
+    api_key_file: Optional[str] = None
+    api_key_env: Optional[str] = None
+    type: Optional[str] = None
+    display_name: Optional[str] = None
+    customer: Optional[str] = None
+    # "ga" = GA Realtime API (no beta header, gpt-realtime model family) — DEFAULT
+    # "beta" = Beta Realtime API (OpenAI-Beta header, gpt-4o-realtime-preview models)
+    # OpenAI sunset the Beta Realtime API on 2026-05-12 and removed the
+    # gpt-4o-realtime-preview-* model snapshots on 2026-05-07. Beta is retained
+    # as a config knob for forward-compat / debugging only; setting it now
+    # produces a one-shot warning and OpenAI rejects the WebSocket with
+    # beta_api_shape_disabled. See docs/MIGRATION.md and the v6.5.3 hotfix.
+    api_version: str = Field(default="ga")
+    # Current GA Realtime models (verified against OpenAI's official docs):
+    #   gpt-realtime        — stable conversational (default)
+    #   gpt-realtime-1.5    — best audio-in/audio-out quality
+    #   gpt-realtime-2      — reasoning voice model with configurable effort
+    #   gpt-realtime-mini   — cost-optimized
+    model: str = Field(default="gpt-realtime")
+    voice: str = Field(default="alloy")
+    base_url: str = Field(default="wss://api.openai.com/v1/realtime")
+    instructions: Optional[str] = None
+    organization: Optional[str] = None
+    project_id: Optional[str] = None  # OpenAI project ID for usage tracking (OpenAI-Project header)
+    input_encoding: str = Field(default="slin16")  # AudioSocket inbound default (8 kHz PCM16)
+    input_sample_rate_hz: int = Field(default=8000)  # AudioSocket source sample rate
+    provider_input_encoding: str = Field(default="linear16")  # Provider expects PCM16 LE
+    provider_input_sample_rate_hz: int = Field(default=24000)  # OpenAI Realtime input sample rate
+    input_gain_target_rms: int = Field(default=0)
+    input_gain_max_db: float = Field(default=0.0)
+    output_encoding: str = Field(default="linear16")  # Provider emits PCM16 frames
+    output_sample_rate_hz: int = Field(default=24000)
+    output_resampler: Literal["inherit", "linear", "bandlimited"] = Field(default="inherit")
+    target_encoding: str = Field(default="ulaw")  # Downstream AudioSocket expectations
+    target_sample_rate_hz: int = Field(default=8000)
+    response_modalities: List[str] = Field(default_factory=lambda: ["text", "audio"])
+    egress_pacer_enabled: bool = Field(default=False)
+    egress_pacer_warmup_ms: int = Field(default=320)
+    # Optional explicit greeting to speak immediately on connect
+    greeting: Optional[str] = None
+    # Optional server-side turn detection configuration
+    # If provided, will be sent in session.update
+    class TurnDetectionConfig(BaseModel):
+        type: str = Field(default="server_vad")
+        silence_duration_ms: int = Field(default=200)
+        threshold: float = Field(default=0.5)
+        prefix_padding_ms: int = Field(default=200)
+
+    turn_detection: Optional[TurnDetectionConfig] = None
+
+
+class GrokProviderConfig(BaseModel):
+    """Configuration for the xAI Grok Voice Agent realtime provider.
+
+    The Voice Agent API is OpenAI-Realtime-compatible at the wire level with
+    minor deviations (nested audio.{input,output}.format shape; ``response.text.delta``
+    event naming; 30-min session cap). This config models the xAI-native shape
+    directly; the OpenAI provider is NOT reused. See Provider-Grok-Setup.md.
+    """
+
+    enabled: bool = Field(default=True)
+    # Credentials: prefer per-instance api_key_file (set by admin UI); falls back to
+    # api_key_env name, then inline api_key, then legacy XAI_API_KEY env.
+    api_key: Optional[str] = None
+    api_key_file: Optional[str] = None
+    api_key_env: Optional[str] = None
+    # Connection
+    base_url: str = Field(default="wss://api.x.ai/v1/realtime")
+    model: str = Field(default="grok-voice-latest")
+    voice: str = Field(default="eve")  # named: eve|ara|rex|sal|leo, or a custom voice ID
+    instructions: Optional[str] = None
+    greeting: Optional[str] = None
+    # Audio defaults:
+    # - Input: μ-law @ 8 kHz passthrough (Asterisk-native — confirmed working).
+    # - Output: PCM16 @ 24 kHz. xAI ignores the per-session output_format declaration
+    #   and emits 24 kHz PCM16 regardless (no session.updated ACK arrives to negotiate
+    #   otherwise — observed on live calls 2026-05-22). Declaring the truth here means
+    #   the resampler correctly downsamples 24 kHz → 8 kHz for AudioSocket instead of
+    #   playing 24 kHz content at 8 kHz (which sounds garbled / chipmunk-slow).
+    input_encoding: str = Field(default="ulaw")
+    input_sample_rate_hz: int = Field(default=8000)
+    provider_input_encoding: str = Field(default="ulaw")  # "ulaw" or "linear16" (fallback)
+    provider_input_sample_rate_hz: int = Field(default=8000)
+    output_encoding: str = Field(default="linear16")  # xAI emits PCM16 in practice
+    output_sample_rate_hz: int = Field(default=24000)  # xAI's actual native output rate
+    output_resampler: Literal["inherit", "linear", "bandlimited"] = Field(default="inherit")
+    target_encoding: str = Field(default="ulaw")  # AudioSocket egress format
+    target_sample_rate_hz: int = Field(default=8000)
+    input_gain_target_rms: int = Field(default=0)
+    input_gain_max_db: float = Field(default=0.0)
+    # Response shape
+    response_modalities: List[str] = Field(default_factory=lambda: ["text", "audio"])
+    egress_pacer_enabled: bool = Field(default=False)
+    egress_pacer_warmup_ms: int = Field(default=320)
+    # Multi-tenant display metadata (admin UI surfaces these)
+    display_name: Optional[str] = None
+    customer: Optional[str] = None
+    # YAML escape hatch for xAI-native tools (file_search, web_search, x_search, mcp).
+    # Each entry is sent as-is in session.update.tools, appended after function tools.
+    extra_tools: List[Dict[str, Any]] = Field(default_factory=list)
+    # 30-min session cap: warn at this elapsed second count
+    session_warn_after_seconds: int = Field(default=28 * 60)
+
+    class TurnDetectionConfig(BaseModel):
+        type: str = Field(default="server_vad")
+        silence_duration_ms: int = Field(default=600)
+        threshold: float = Field(default=0.5)
+        prefix_padding_ms: int = Field(default=300)
+
+    turn_detection: Optional[TurnDetectionConfig] = None
+
+
+class BargeInConfig(BaseModel):
+    enabled: bool = Field(default=True)
+    initial_protection_ms: int = Field(default=200)
+    min_ms: int = Field(default=250)
+    energy_threshold: int = Field(default=1000)
+    cooldown_ms: int = Field(default=500)
+    # Pipeline (hybrid/local) barge-in tuning: pipelines play TTS locally (file playback),
+    # so we can use a more sensitive detector without colliding with provider-owned VAD.
+    pipeline_min_ms: int = Field(default=120)
+    pipeline_energy_threshold: int = Field(default=300)
+    # Pipelines: prefer Asterisk-side talk detection (TALK_DETECT) for robust barge-in,
+    # because ExternalMedia RTP can be paused/altered during channel playback.
+    pipeline_talk_detect_enabled: bool = Field(default=True)
+    # TALK_DETECT(set)=<dsp_silence_threshold_ms>,<dsp_talking_threshold>
+    pipeline_talk_detect_silence_ms: int = Field(default=1200)
+    pipeline_talk_detect_talking_threshold: int = Field(default=256)
+    # Minimum TTS elapsed time (ms) before TalkDetect barge-in is honoured.
+    # Higher than initial_protection_ms to reject phone-echo triggering TALK_DETECT.
+    talk_detect_initial_protection_ms: int = Field(default=1500)
+    # New: short guard window after TTS ends to avoid self-echo re-capture
+    post_tts_end_protection_ms: int = Field(default=250)
+    # Extra protection during the first greeting turn
+    greeting_protection_ms: int = Field(default=0)
+    # Provider-owned mode: local VAD fallback for providers whose server-side
+    # interruption event may be disabled or unavailable for a given agent.
+    provider_fallback_enabled: bool = Field(default=True)
+    provider_fallback_providers: List[str] = Field(
+        default_factory=lambda: [
+            "google_live",
+            "deepgram",
+            "elevenlabs_agent",
+            "grok",
+        ]
+    )
+    # Optional per-provider reaction threshold. Keys may be provider instance
+    # names or canonical provider kinds. Unlisted providers retain min_ms.
+    provider_fallback_min_ms_by_provider: Dict[str, int] = Field(
+        default_factory=lambda: {"grok": 120}
+    )
+    # Provider-owned mode: suppress outbound provider audio locally after barge-in so continuing provider audio
+    # doesn't immediately restart streaming playback.
+    provider_output_suppress_ms: int = Field(default=1200)
+    provider_output_suppress_extend_ms: int = Field(default=600)
+    # While suppressed, extend the suppression window when provider chunks keep arriving.
+    # This prevents "tail resume" if a provider keeps streaming already-generated audio after barge-in.
+    provider_output_suppress_chunk_extend_ms: int = Field(default=250)
+
+    @field_validator("provider_fallback_min_ms_by_provider")
+    @classmethod
+    def _validate_provider_fallback_minimums(
+        cls, value: Dict[str, int]
+    ) -> Dict[str, int]:
+        for provider_name, duration_ms in value.items():
+            if not str(provider_name).strip():
+                raise ValueError("provider fallback override names cannot be empty")
+            if not 40 <= int(duration_ms) <= 5000:
+                raise ValueError(
+                    "provider fallback minimums must be between 40 and 5000 ms"
+                )
+        return value
+
+
+class LLMConfig(BaseModel):
+    # Defaults are generic; inject_llm_config() applies YAML/env precedence.
+    initial_greeting: str = "Hello, how can I help you today?"
+    prompt: str = "You are a helpful assistant."
+    # Note: model field removed - not used by any provider (each provider has its own model config)
+    api_key: Optional[str] = None
+
+
+class VADConfig(BaseModel):
+    use_provider_vad: bool = Field(default=False)  # Deprecated: use vad_mode instead
+    vad_mode: Literal["auto", "local", "provider"] = Field(
+        default="auto",
+        description="VAD mode: 'auto' (decide per-provider based on capabilities), "
+                    "'local' (always use local VAD), 'provider' (prefer provider VAD, equivalent to use_provider_vad=true)"
+    )
+    enhanced_enabled: bool = Field(default=False)
+    # WebRTC VAD settings - optimized for real-time conversation
+    webrtc_aggressiveness: int = 1
+    webrtc_start_frames: int = 2
+    webrtc_end_silence_frames: int = 15
+    # Enhanced VAD thresholds
+    energy_threshold: int = 1500
+    confidence_threshold: float = 0.6
+    adaptive_threshold_enabled: bool = True
+    noise_adaptation_rate: float = 0.1
+    
+    # Utterance settings - optimized for real-time conversation
+    min_utterance_duration_ms: int = 800
+    max_utterance_duration_ms: int = 8000
+    utterance_padding_ms: int = 100
+    
+    # Fallback settings
+    fallback_enabled: bool = True
+    fallback_interval_ms: int = 1500
+    fallback_buffer_size: int = 128000
+
+    # Provider-agnostic upstream squelch (helps server-side VAD providers terminate turns in noisy environments).
+    # Applies only to providers that require continuous audio.
+    upstream_squelch_enabled: bool = True
+    # Base RMS threshold in PCM16 space. Lower values are more permissive (less likely to clip quiet speakers).
+    upstream_squelch_base_rms: int = 200
+    # Dynamic threshold multiplier: threshold = max(base_rms, noise_floor_rms * noise_factor)
+    upstream_squelch_noise_factor: float = 2.5
+    # Exponential moving average factor for noise floor updates (0..1). Higher adapts faster.
+    upstream_squelch_noise_ema_alpha: float = 0.06
+    # Hysteresis: require N speech frames to enter speaking state, and M silence frames to exit.
+    upstream_squelch_min_speech_frames: int = 2
+    upstream_squelch_end_silence_frames: int = 15
+
+
+class NoInputConfig(BaseModel):
+    """Provider-independent caller inactivity policy.
+
+    Inbound calls are protected by default. Outbound calls must opt in at the
+    agent/context level so campaigns are not changed unexpectedly.
+    """
+
+    enabled: bool = Field(default=True)
+    inbound_enabled: bool = Field(default=True)
+    outbound_enabled: bool = Field(default=False)
+    initial_timeout_sec: float = Field(default=30.0, ge=1.0, le=3600.0)
+    grace_timeout_sec: float = Field(default=15.0, ge=1.0, le=3600.0)
+    max_check_ins: int = Field(default=1, ge=0, le=10)
+    check_in_message: str = Field(default="Are you still there?", min_length=1, max_length=500)
+    final_message: str = Field(
+        default="I still can't hear you, so I'll end the call now. Goodbye.",
+        min_length=1,
+        max_length=500,
+    )
+
+    @field_validator("check_in_message", "final_message")
+    @classmethod
+    def validate_announcement_message(cls, value: str) -> str:
+        """Reject blank announcements and store normalized message text."""
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("caller inactivity announcement messages must not be blank")
+        return normalized
+
+
+class StreamingConfig(BaseModel):
+    sample_rate: int = Field(default=8000)
+    jitter_buffer_ms: int = Field(default=50)
+    keepalive_interval_ms: int = Field(default=5000)
+    connection_timeout_ms: int = Field(default=10000)
+    fallback_timeout_ms: int = Field(default=4000)
+    chunk_size_ms: int = Field(default=20)
+    min_start_ms: int = Field(default=120)
+    low_watermark_ms: int = Field(default=80)
+    provider_grace_ms: int = Field(default=500)
+    logging_level: str = Field(default="info")
+    # Development diagnostics. diag_out_dir is the legacy playback-tap output
+    # directory (DIAG_TAP_OUTPUT_DIR), not the separate full-call RCA tree.
+    # These fields must survive validation so the shared opt-in reaches both
+    # consumers while their incompatible artifact layouts remain separate.
+    diag_enable_taps: bool = Field(default=False)
+    diag_pre_secs: int = Field(default=1, ge=0, le=60)
+    diag_post_secs: int = Field(default=1, ge=0, le=60)
+    diag_out_dir: str = Field(default=DEFAULT_DIAGNOSTIC_TAP_DIR)
+    # Smaller warm-up only for the initial greeting to get first audio out sooner
+    greeting_min_start_ms: int = Field(default=0)
+    # Hold the initial greeting until inbound media is confirmed, then send
+    # this much silent media before the first spoken sample.  This protects the
+    # greeting from answer/bridge clipping without delaying later turns.
+    greeting_media_ready_delay_ms: int = Field(default=0, ge=0, le=2000)
+    greeting_media_ready_timeout_ms: int = Field(default=1000, ge=0, le=5000)
+    # ExternalMedia-specific: safety net timeout (ms) for RTP endpoint establishment.
+    # With RTP kick fix, RTP establishes in ~40-50ms. This fallback rarely triggers.
+    greeting_rtp_wait_ms: int = Field(default=1000)
+    # Egress endianness control for PCM16 slin16 over AudioSocket: 'auto'|'force_true'|'force_false'
+    # - auto: derive from inbound probe (current behavior)
+    # - force_true: always byteswap outbound PCM16
+    # - force_false: never byteswap outbound PCM16 (send native LE)
+    egress_swap_mode: str = Field(default="auto")
+    # When true, force outbound streaming audio to μ-law regardless of provider encoding.
+    egress_force_mulaw: bool = Field(default=False)
+    # Overlap LLM token streaming with TTS synthesis in modular pipelines.
+    # Streams tokens → splits into sentences → synthesizes each sentence concurrently.
+    pipeline_streaming_overlap: bool = Field(default=True)
+    # Play a brief filler phrase (e.g. "One moment please.") via the pipeline TTS
+    # adapter immediately when a user turn is detected, before LLM inference starts.
+    pipeline_filler_enabled: bool = Field(default=False)
+    pipeline_filler_phrases: List[str] = Field(default_factory=lambda: [
+        "One moment please.",
+        "Let me check on that.",
+        "Sure thing.",
+        "Just a moment.",
+    ])
+
+
+class LoggingConfig(BaseModel):
+    """Top-level logging configuration for the ai-engine service."""
+    level: str = Field(default="info")  # debug|info|warning|error|critical
+
+
+class HealthConfig(BaseModel):
+    """Health/metrics HTTP endpoint configuration."""
+    host: str = Field(default="127.0.0.1")
+    port: int = Field(default=15000)
+
+
+class PipelineEntry(BaseModel):
+    stt: str
+    llm: str
+    tts: str
+    tools: List[str] = Field(default_factory=list)
+    options: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+
+
+# Milestone7: Compose canonical component names for provider-backed pipelines.
+def _compose_provider_components(provider: str) -> Dict[str, Any]:
+    return {
+        "stt": f"{provider}_stt",
+        "llm": f"{provider}_llm",
+        "tts": f"{provider}_tts",
+        "tools": [],
+        "options": {}
+    }
+
+
+# Milestone7: Normalize pipeline definitions into the PipelineEntry schema.
+def _normalize_pipelines(config_data: Dict[str, Any]) -> None:
+    default_provider = config_data.get("default_provider", "openai_realtime")
+    pipelines_cfg = config_data.get("pipelines")
+
+    if not pipelines_cfg and full_agent_default(config_data):
+        config_data["pipelines"] = {}
+        config_data.setdefault("active_pipeline", None)
+        return
+
+    if not pipelines_cfg:
+        _generate_default_pipeline(config_data)
+        return
+
+    normalized: Dict[str, Dict[str, Any]] = {}
+
+    for pipeline_name, raw_entry in pipelines_cfg.items():
+        if raw_entry is None:
+            normalized[pipeline_name] = _compose_provider_components(default_provider)
+            continue
+
+        if isinstance(raw_entry, str):
+            normalized[pipeline_name] = _compose_provider_components(raw_entry)
+            continue
+
+        if isinstance(raw_entry, dict):
+            provider_hint = raw_entry.get("provider")
+            provider_for_defaults = provider_hint or default_provider
+            components = _compose_provider_components(provider_for_defaults)
+
+            options_block = raw_entry.get("options") or {}
+            if not isinstance(options_block, dict):
+                raise TypeError(
+                    f"Unsupported pipeline options type for '{pipeline_name}': {type(options_block).__name__}"
+                )
+
+            normalized_entry = {
+                "stt": raw_entry.get("stt", components["stt"]),
+                "llm": raw_entry.get("llm", components["llm"]),
+                "tts": raw_entry.get("tts", components["tts"]),
+                "tools": raw_entry.get("tools") or [],
+                "options": options_block,
+            }
+
+            normalized[pipeline_name] = normalized_entry
+            continue
+
+        raise TypeError(f"Unsupported pipeline definition for '{pipeline_name}': {type(raw_entry).__name__}")
+
+    config_data["pipelines"] = normalized
+    config_data.setdefault("active_pipeline", next(iter(normalized.keys())))
+
+
+class AppConfig(BaseModel):
+    _legacy_contexts_for_hash: Optional[Dict[str, Any]] = PrivateAttr(default=None)
+
+    # Config schema marker used by migration tooling and release docs.
+    config_version: int = Field(default=6, ge=1)
+    default_provider: str
+    providers: Dict[str, Any]
+    asterisk: AsteriskConfig
+    llm: LLMConfig
+    audio_transport: str = Field(default="externalmedia")  # 'externalmedia' | 'legacy'
+    downstream_mode: str = Field(default="stream")  # 'file' | 'stream'
+    external_media: Optional[ExternalMediaConfig] = Field(default_factory=ExternalMediaConfig)
+    audiosocket: Optional[AudioSocketConfig] = Field(default_factory=AudioSocketConfig)
+    vad: Optional[VADConfig] = Field(default_factory=VADConfig)
+    no_input: Optional[NoInputConfig] = Field(default_factory=NoInputConfig)
+    streaming: Optional[StreamingConfig] = Field(default_factory=StreamingConfig)
+    barge_in: Optional[BargeInConfig] = Field(default_factory=BargeInConfig)
+    logging: Optional[LoggingConfig] = Field(default_factory=LoggingConfig)
+    health: Optional[HealthConfig] = Field(default_factory=HealthConfig)
+    pipelines: Dict[str, PipelineEntry] = Field(default_factory=dict)
+    active_pipeline: Optional[str] = None
+    # P1: profiles/contexts for transport orchestration
+    profiles: Dict[str, Any] = Field(default_factory=dict)
+    contexts: Dict[str, Any] = Field(default_factory=dict)
+    # Tool calling configuration (v4.1)
+    tools: Dict[str, Any] = Field(default_factory=dict)
+    # In-call HTTP tool definitions (Milestone 24)
+    # Admin UI stores AI-invokable HTTP tool configs under `in_call_tools:`.
+    in_call_tools: Dict[str, Any] = Field(default_factory=dict)
+    # MCP tool configuration (experimental)
+    mcp: Optional[MCPConfig] = None
+    # Farewell hangup delay - seconds to wait after farewell audio completes before hangup
+    # Ensures farewell message fully plays through RTP pipeline before disconnecting
+    # Increase if farewell gets cut off (typical farewells need 2-4 seconds)
+    farewell_hangup_delay_sec: float = Field(default=5.0)
+
+    # HIGH-3: behavior when the AI provider fails to start a session on an
+    # already-answered channel. "announce_hangup" (default) plays a short error
+    # prompt then hangs up so the caller is not left in silent dead air;
+    # "leave_open" preserves the legacy behavior (log + cleanup only, line stays
+    # open until the caller hangs up).
+    on_provider_failure: Literal["announce_hangup", "dialplan_redirect", "leave_open"] = Field(
+        default="announce_hangup"
+    )
+    # Asterisk sound file played to the caller before hangup when a provider fails
+    # to start. May be a bare sound name ("custom/foo") or a "sound:"/"recording:"
+    # URI. Best-effort: if missing/unplayable the channel is still hung up.
+    provider_failure_prompt: str = Field(default="sorry-youre-having-problems")
+    # Opt-in recovery route used only when on_provider_failure=dialplan_redirect.
+    # The caller leaves Stasis and resumes at this dialplan location; auxiliary
+    # media channels are cleaned up without hanging up the caller channel.
+    provider_failure_redirect_context: Optional[str] = None
+    provider_failure_redirect_extension: str = Field(default="s", min_length=1)
+    provider_failure_redirect_priority: int = Field(default=1, ge=1)
+
+    # Ensure tests that construct AppConfig(**dict) directly still get normalized pipelines
+    # similar to load_config(), which calls _normalize_pipelines().
+    from pydantic import model_validator  # local import to keep top clear
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_before(cls, data: Any):  # type: ignore[override]
+        try:
+            if isinstance(data, dict):
+                _normalize_pipelines(data)
+        except Exception as e:
+            # Non-fatal: if normalization fails, Pydantic will raise a more specific error later
+            logger.debug("Pipeline normalization failed (will be caught by Pydantic)", error=str(e))
+            pass
+        return data
+
+    @model_validator(mode="after")
+    def _validate_audio_profile_contracts(self) -> "AppConfig":
+        """Reject invalid audio-policy and Asterisk profile contracts."""
+        allowed_resamplers = {"linear", "bandlimited"}
+        allowed_overrides = allowed_resamplers | {"inherit"}
+
+        def validate_resampler(
+            location: str, value: Any, *, allow_inherit: bool = False
+        ) -> None:
+            allowed = allowed_overrides if allow_inherit else allowed_resamplers
+            if value not in allowed:
+                raise ValueError(
+                    f"{location} must be one of {sorted(allowed)!r}; got {value!r}"
+                )
+
+        g711_rates = {
+            "ulaw": 8000,
+            "mulaw": 8000,
+            "mu-law": 8000,
+            "alaw": 8000,
+            "a-law": 8000,
+        }
+
+        def validate_provider_pair(
+            provider_name: str,
+            provider_config: Dict[str, Any],
+            encoding_field: str,
+            rate_field: str,
+        ) -> None:
+            """Reject G.711 values paired with a non-telephony sample rate."""
+            if encoding_field not in provider_config or rate_field not in provider_config:
+                return
+            encoding = str(provider_config.get(encoding_field) or "").strip().lower()
+            expected = g711_rates.get(encoding)
+            if expected is None:
+                return
+            raw_rate = provider_config.get(rate_field)
+            if isinstance(raw_rate, float) and not raw_rate.is_integer():
+                raise ValueError(
+                    f"providers.{provider_name}.{rate_field} must be an integer"
+                )
+            try:
+                rate = int(raw_rate)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"providers.{provider_name}.{rate_field} must be an integer"
+                ) from exc
+            if rate != expected:
+                raise ValueError(
+                    f"providers.{provider_name} has unsupported "
+                    f"{encoding_field}/{rate_field} pair {encoding}@{rate}; "
+                    f"{encoding} requires {expected} Hz (G.711). Restore audio "
+                    "defaults in the Admin UI or POST "
+                    f"/api/config/providers/{provider_name}/audio/reset."
+                )
+
+        # ``providers`` remains intentionally open-ended for third-party
+        # adapters, so enforce this shared transport policy explicitly rather
+        # than relying on provider-specific Pydantic models being selected.
+        for provider_name, provider_config in self.providers.items():
+            if not isinstance(provider_config, dict):
+                continue
+            if "output_resampler" in provider_config:
+                validate_resampler(
+                    f"providers.{provider_name}.output_resampler",
+                    provider_config.get("output_resampler"),
+                    allow_inherit=True,
+                )
+            for encoding_field, rate_field in (
+                ("input_encoding", "input_sample_rate_hz"),
+                ("provider_input_encoding", "provider_input_sample_rate_hz"),
+                ("output_encoding", "output_sample_rate_hz"),
+                ("target_encoding", "target_sample_rate_hz"),
+                ("tts_audio_encoding", "tts_sample_rate_hz"),
+            ):
+                validate_provider_pair(
+                    str(provider_name), provider_config, encoding_field, rate_field
+                )
+
+        # Per-pipeline TTS options are the narrow rollback/canary override.
+        # Validate them at load/apply time so a typo cannot fail mid-call.
+        for pipeline_name, pipeline in self.pipelines.items():
+            tts_options = pipeline.options.get("tts")
+            if isinstance(tts_options, dict) and "output_resampler" in tts_options:
+                validate_resampler(
+                    f"pipelines.{pipeline_name}.options.tts.output_resampler",
+                    tts_options.get("output_resampler"),
+                    allow_inherit=True,
+                )
+            if isinstance(tts_options, dict) and "streaming_overlap" in tts_options:
+                overlap_value = tts_options.get("streaming_overlap")
+                if type(overlap_value) is not bool:
+                    raise ValueError(
+                        "pipelines."
+                        f"{pipeline_name}.options.tts.streaming_overlap must be "
+                        f"true or false; got {overlap_value!r}"
+                    )
+            stt_options = pipeline.options.get("stt")
+            if isinstance(stt_options, dict):
+                for option_name, minimum, maximum in (
+                    ("segment_energy_threshold", 0, 32767),
+                    ("segment_silence_ms", 100, 5000),
+                ):
+                    if option_name not in stt_options:
+                        continue
+                    option_value = stt_options.get(option_name)
+                    if type(option_value) is not int or not minimum <= option_value <= maximum:
+                        raise ValueError(
+                            f"pipelines.{pipeline_name}.options.stt.{option_name} "
+                            f"must be an integer from {minimum} to {maximum}; "
+                            f"got {option_value!r}"
+                        )
+
+        if not self.profiles:
+            return self
+
+        default_profile = self.profiles.get("default")
+        if isinstance(default_profile, str) and default_profile not in self.profiles:
+            raise ValueError(
+                f"profiles.default references missing profile {default_profile!r}"
+            )
+
+        fixed_rates = {
+            "ulaw": 8000,
+            "mulaw": 8000,
+            "mu-law": 8000,
+            "alaw": 8000,
+            "a-law": 8000,
+            "slin": 8000,
+            "slin16": 16000,
+        }
+
+        def validate_pair(profile_name: str, section_name: str, section: Any) -> None:
+            if not isinstance(section, dict):
+                return
+            encoding = str(section.get("encoding") or "").strip().lower()
+            raw_rate = section.get("sample_rate_hz")
+            if not encoding or raw_rate is None:
+                return
+            try:
+                rate = int(raw_rate)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"profile {profile_name!r} {section_name}.sample_rate_hz "
+                    "must be an integer"
+                ) from exc
+            expected = fixed_rates.get(encoding)
+            if expected is not None and rate != expected:
+                raise ValueError(
+                    f"profile {profile_name!r} has unsupported {section_name} "
+                    f"pair {encoding}@{rate}; {encoding} requires {expected} Hz"
+                )
+
+        for profile_name, raw_profile in self.profiles.items():
+            if profile_name == "default" or not isinstance(raw_profile, dict):
+                continue
+            if "talk_detect_talking_threshold" in raw_profile:
+                threshold = raw_profile.get("talk_detect_talking_threshold")
+                if type(threshold) is not int or not 1 <= threshold <= 32768:
+                    raise ValueError(
+                        f"profiles.{profile_name}.talk_detect_talking_threshold "
+                        "must be an integer from 1 to 32768; "
+                        f"got {threshold!r}"
+                    )
+            if "output_resampler" in raw_profile:
+                validate_resampler(
+                    f"profiles.{profile_name}.output_resampler",
+                    raw_profile.get("output_resampler"),
+                )
+            validate_pair(profile_name, "transport_out", raw_profile.get("transport_out"))
+            provider_pref = raw_profile.get("provider_pref")
+            if isinstance(provider_pref, dict):
+                validate_pair(
+                    profile_name,
+                    "provider_pref.input",
+                    {
+                        "encoding": provider_pref.get("input_encoding"),
+                        "sample_rate_hz": provider_pref.get("input_sample_rate_hz"),
+                    },
+                )
+                validate_pair(
+                    profile_name,
+                    "provider_pref.output",
+                    {
+                        "encoding": provider_pref.get("output_encoding"),
+                        "sample_rate_hz": provider_pref.get("output_sample_rate_hz"),
+                    },
+                )
+
+        return self
+
+def _generate_default_pipeline(config_data: Dict[str, Any]) -> None:
+    """Populate a default pipeline entry when none are provided."""
+    default_provider = config_data.get("default_provider", "openai_realtime")
+    if full_agent_default(config_data):
+        config_data.setdefault("pipelines", {})
+        config_data.setdefault("active_pipeline", None)
+        return
+    pipeline_name = "default"
+    # Milestone7: Align implicit defaults with the PipelineEntry schema.
+    default_components = _compose_provider_components(default_provider)
+
+    pipelines = config_data.setdefault("pipelines", {})
+    existing_entry = pipelines.get(pipeline_name)
+
+    if existing_entry is None:
+        pipelines[pipeline_name] = _compose_provider_components(default_provider)
+    elif isinstance(existing_entry, str):
+        pipelines[pipeline_name] = _compose_provider_components(existing_entry)
+    elif isinstance(existing_entry, dict):
+        existing_entry.setdefault("stt", default_components["stt"])
+        existing_entry.setdefault("llm", default_components["llm"])
+        existing_entry.setdefault("tts", default_components["tts"])
+        if not isinstance(existing_entry.get("options"), dict):
+            existing_entry["options"] = {}
+    else:
+        pipelines[pipeline_name] = _compose_provider_components(default_provider)
+
+    config_data.setdefault("active_pipeline", pipeline_name)
+
+
+def load_config(path: str = "config/ai-agent.yaml") -> AppConfig:
+    """
+    Load and validate configuration from YAML file.
+    
+    AAVA-40: Refactored to use dedicated helper functions for improved
+    testability and reduced complexity (was 250 lines, now <30).
+    
+    Args:
+        path: Path to YAML configuration file (absolute or relative to project root)
+        
+    Returns:
+        Validated AppConfig instance
+        
+    Raises:
+        FileNotFoundError: If configuration file doesn't exist
+        yaml.YAMLError: If YAML parsing fails
+        
+    Complexity: 5 (down from ~20)
+    """
+    # Phase 1: Load YAML file with environment variable expansion and local overrides
+    path = resolve_config_path(path)
+    from src.core.legacy_agent_migration import merged_raw_legacy_contexts
+
+    raw_legacy_contexts = merged_raw_legacy_contexts(
+        path, os.path.join(os.path.dirname(path), "contexts")
+    )
+    config_data = load_yaml_with_local_override(path)
+    if isinstance(config_data, dict):
+        config_data.setdefault("config_version", 6)
+
+    # Backward compatibility: older docs/configs used `in_call_http_tools` at the top-level.
+    # Canonical key is now `in_call_tools` (dict of tool_name -> config).
+    try:
+        if (
+            isinstance(config_data, dict)
+            and isinstance(config_data.get("in_call_http_tools"), dict)
+            and not isinstance(config_data.get("in_call_tools"), dict)
+        ):
+            logger.warning(
+                "Config uses deprecated top-level `in_call_http_tools`; migrating to `in_call_tools`",
+            )
+            config_data["in_call_tools"] = config_data.pop("in_call_http_tools")
+    except Exception:
+        logger.debug("Failed normalizing in-call tool key alias", exc_info=True)
+
+    # Phase 2: Security - Inject credentials from environment variables only
+    inject_asterisk_credentials(config_data)
+    inject_llm_config(config_data)
+    inject_provider_api_keys(config_data)
+
+    # Optional authoritative extension inventory. Hydration happens on every
+    # startup/reload so removals and renames cannot leave stale runtime routes.
+    from src.integrations.freepbx_extensions import hydrate_freepbx_extension_inventory
+    hydrate_freepbx_extension_inventory(config_data)
+
+    # Phase 2b: Merge external context YAML files (config/contexts/*.yaml)
+    try:
+        _merge_external_contexts(config_data)
+    except Exception as e:
+        # Non-fatal; log debug and continue with inline contexts only
+        logger.debug("External context merge failed", error=str(e))
+    
+    # Phase 3: Apply default values
+    apply_transport_defaults(config_data)
+    apply_audiosocket_defaults(config_data)
+    apply_externalmedia_defaults(config_data)
+    apply_diagnostic_defaults(config_data)
+    apply_barge_in_defaults(config_data)
+    
+    # Phase 4: Normalize configuration
+    normalize_pipelines(config_data)
+    normalize_profiles(config_data)
+    normalize_local_provider_tokens(config_data)
+    if normalize_legacy_openai_audio(config_data):
+        logger.warning(
+            "Migrated legacy OpenAI Realtime mulaw@24000 output to linear16@24000"
+        )
+    
+    # Phase 4b: Validate normalized configuration
+    from src.config.normalization import validate_providers, validate_pipelines, ConfigValidationError
+    try:
+        validate_providers(config_data)
+        validate_pipelines(config_data)
+    except ConfigValidationError as e:
+        logger.error("Configuration validation failed", error=str(e))
+        raise
+    
+    # Phase 5: Validate and return
+    config = AppConfig(**config_data)
+    config._legacy_contexts_for_hash = raw_legacy_contexts
+    return config
+
+
+def _merge_external_contexts(config_data: Dict[str, Any]) -> None:
+    """
+    Merge contexts from config/contexts/*.yaml into config_data['contexts'].
+
+    Precedence:
+    - Inline contexts in ai-agent.yaml win over external files on key collision.
+    - External context files must define a 'name' field used as the context key.
+    - 'system_prompt' in external files is mapped to 'prompt' if 'prompt' is absent.
+    """
+    try:
+        import glob
+
+        contexts_dir = os.path.join(_PROJ_DIR, "config", "contexts")
+        if not os.path.isdir(contexts_dir):
+            return
+
+        # Start from any existing inline contexts
+        existing_contexts = config_data.get("contexts") or {}
+        if not isinstance(existing_contexts, dict):
+            existing_contexts = {}
+
+        pattern_yaml = os.path.join(contexts_dir, "*.yaml")
+        pattern_yml = os.path.join(contexts_dir, "*.yml")
+        files = glob.glob(pattern_yaml) + glob.glob(pattern_yml)
+
+        for ctx_path in files:
+            try:
+                with open(ctx_path, "r") as f:
+                    raw = f.read()
+                raw = os.path.expandvars(raw)
+                ctx_data = yaml.safe_load(raw) or {}
+            except Exception:
+                continue
+
+            if not isinstance(ctx_data, dict):
+                continue
+
+            name = ctx_data.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            name = name.strip()
+
+            # Map system_prompt → prompt if prompt not explicitly provided
+            if "prompt" not in ctx_data and "system_prompt" in ctx_data:
+                ctx_data["prompt"] = ctx_data["system_prompt"]
+
+            # Only add external context if not already defined inline
+            if name not in existing_contexts:
+                existing_contexts[name] = ctx_data
+
+        config_data["contexts"] = existing_contexts
+    except Exception:
+        # Let caller decide how to handle/log; keep non-fatal here.
+        raise
+
+def validate_production_config(config: AppConfig) -> tuple[list[str], list[str]]:
+    """Validate configuration for production deployment (AAVA-21).
+    
+    Args:
+        config: AppConfig instance to validate
+        
+    Returns:
+        (errors, warnings): Lists of validation errors and warnings
+        
+    Errors block startup, warnings are logged but non-blocking.
+    """
+    errors = []
+    warnings = []
+    
+    # Critical checks (errors)
+    try:
+        # Config version guidance (non-blocking): allows older configs but makes drift explicit.
+        config_version = getattr(config, "config_version", 6)
+        if config_version < 6:
+            warnings.append(
+                f"config_version={config_version} is older than the v6 baseline (6); "
+                "review release migration notes before production rollout"
+            )
+
+        # VAD configuration consistency
+        if hasattr(config, 'vad') and config.vad:
+            if getattr(config.vad, 'enhanced_enabled', False):
+                if not hasattr(config.vad, 'webrtc_aggressiveness') or config.vad.webrtc_aggressiveness is None:
+                    errors.append("VAD enabled but webrtc_aggressiveness not set")
+        
+        # AudioSocket format validation
+        if hasattr(config, 'audiosocket') and config.audiosocket:
+            format_val = getattr(config.audiosocket, 'format', None)
+            if format_val and format_val not in ['slin', 'slin16', 'slin24', 'ulaw', 'alaw']:
+                errors.append(f"Invalid audiosocket format: {format_val} (must be slin, slin16, slin24, ulaw, or alaw)")
+        
+        # Provider API keys validation (non-blocking for local-only setups)
+        has_openai = bool(os.getenv('OPENAI_API_KEY'))
+        has_deepgram = bool(os.getenv('DEEPGRAM_API_KEY'))
+        has_google = bool(os.getenv('GOOGLE_API_KEY'))
+        providers_in_use = set()
+        try:
+            for entry in (getattr(config, 'pipelines', {}) or {}).values():
+                stt = getattr(entry, 'stt', None) if not isinstance(entry, dict) else entry.get('stt')
+                llm = getattr(entry, 'llm', None) if not isinstance(entry, dict) else entry.get('llm')
+                tts = getattr(entry, 'tts', None) if not isinstance(entry, dict) else entry.get('tts')
+                for name in (stt, llm, tts):
+                    if not name:
+                        continue
+                    lower = str(name).lower()
+                    if lower.startswith('local'):
+                        continue
+                    providers_in_use.add(lower)
+        except Exception:
+            pass
+
+        if providers_in_use and not (has_openai or has_deepgram or has_google):
+            warnings.append(
+                "No provider API keys configured; pipelines referencing non-local providers will fall back to placeholders or fail."
+            )
+        
+        # Port validation
+        if hasattr(config, 'audiosocket') and config.audiosocket:
+            port = getattr(config.audiosocket, 'port', None)
+            if port and (port < 1024 or port > 65535):
+                errors.append(f"AudioSocket port {port} out of valid range (1024-65535)")
+        
+        # Production warnings (non-blocking)
+        log_level = os.getenv('LOG_LEVEL', 'info').lower()
+        if log_level == 'debug':
+            warnings.append("Debug logging enabled (security/performance risk in production)")
+        # Streaming logging verbosity warnings
+        try:
+            streaming_log_level = os.getenv('STREAMING_LOG_LEVEL', 'info').lower()
+            if streaming_log_level == 'debug':
+                warnings.append("Streaming log level is DEBUG (increases log volume; set STREAMING_LOG_LEVEL=info for production)")
+        except Exception as e:
+            logger.debug("Failed to check streaming log level", error=str(e))
+            pass
+        
+        # Streaming configuration warnings
+        if hasattr(config, 'streaming') and config.streaming:
+            jitter_buffer = getattr(config.streaming, 'jitter_buffer_ms', 100)
+            if jitter_buffer < 100:
+                warnings.append(f"Jitter buffer very small: {jitter_buffer}ms (recommend >= 150ms for production)")
+            elif jitter_buffer > 1000:
+                warnings.append(f"Jitter buffer very large: {jitter_buffer}ms (adds latency, consider reducing)")
+        
+        # Binding exposure warnings
+        try:
+            if hasattr(config, 'audiosocket') and config.audiosocket:
+                if getattr(config.audiosocket, 'host', None) == '0.0.0.0':
+                    warnings.append("AudioSocket bound to 0.0.0.0; ensure firewall/segmentation is in place")
+            if hasattr(config, 'external_media') and config.external_media:
+                if getattr(config.external_media, 'rtp_host', None) == '0.0.0.0':
+                    warnings.append("ExternalMedia RTP bound to 0.0.0.0; ensure firewall/segmentation is in place")
+        except Exception as e:
+            logger.debug("Failed to check bind addresses", error=str(e))
+            pass
+
+        # Check for deprecated/test settings
+        if hasattr(config, 'streaming') and config.streaming:
+            if hasattr(config.streaming, 'diag_enable_taps'):
+                if getattr(config.streaming, 'diag_enable_taps', False):
+                    warnings.append("Diagnostic taps enabled (performance impact, disable in production)")
+
+        # Transport/provider compatibility warnings (non-blocking)
+        try:
+            providers = getattr(config, "providers", {}) or {}
+            # Ensure providers is dict-like
+            if not isinstance(providers, dict):
+                providers = {}
+
+            # Audio transport vs provider/pipeline availability
+            audio_transport = getattr(config, "audio_transport", "externalmedia")
+            
+            # Check for full-agent (monolithic) providers via the
+            # provider-kind registry so multi-instance keys like
+            # `acme_grok` or `globex_openai_realtime` are recognized too
+            # — previously this only matched the canonical key names
+            # (`grok`, `openai_realtime`, …), so a multi-instance-only
+            # config was incorrectly flagged as "no provider configured"
+            # (CodeRabbit on PR #396).
+            from src.config.provider_instances import FULL_AGENT_KINDS, provider_kind
+            monolithic_enabled = []
+            for name, cfg in providers.items():
+                try:
+                    kind = provider_kind(str(name), cfg)
+                except Exception:
+                    # Surface parsing bugs at debug level so they're visible
+                    # in dev logs without spamming production (CodeRabbit
+                    # nitpick on PR #396). `continue` preserves the existing
+                    # "skip-unparseable-entries" behavior for the
+                    # has_monolithic determination.
+                    logger.debug(
+                        "provider_kind() failed during monolithic detection; skipping entry",
+                        provider=str(name),
+                        exc_info=True,
+                    )
+                    continue
+                if kind not in FULL_AGENT_KINDS:
+                    continue
+                enabled = True
+                if isinstance(cfg, dict):
+                    enabled = bool(cfg.get("enabled", True))
+                monolithic_enabled.append((name, enabled))
+            has_monolithic = any(enabled for _, enabled in monolithic_enabled)
+
+            # Check for pipelines
+            pipelines = getattr(config, "pipelines", {}) or {}
+            if not isinstance(pipelines, dict):
+                pipelines = {}
+            has_pipelines = bool(pipelines)
+
+            # Warn if transport has neither providers nor pipelines to use
+            if audio_transport == "audiosocket":
+                if not has_monolithic and not has_pipelines:
+                    warnings.append(
+                        "audio_transport=audiosocket but neither a full-agent provider "
+                        "nor pipelines are configured; "
+                        "AudioSocket requires at least one provider type to function"
+                    )
+            
+            if audio_transport == "externalmedia":
+                if not has_monolithic and not has_pipelines:
+                    warnings.append(
+                        "audio_transport=externalmedia but neither monolithic providers "
+                        "nor pipelines are configured; ExternalMedia requires at least one provider type"
+                    )
+
+                # ExternalMedia RTP security: require explicit allowlist when ASTERISK host is not an IP literal.
+                try:
+                    if getattr(config, "external_media", None):
+                        allowed = getattr(config.external_media, "allowed_remote_hosts", None)
+                        allowed_list = [str(x).strip() for x in (allowed or []) if str(x).strip()]
+                        asterisk_host = str(getattr(getattr(config, "asterisk", None), "host", "") or "").strip()
+
+                        import ipaddress  # local import to avoid global dependency assumptions
+
+                        asterisk_host_is_ip = False
+                        try:
+                            ipaddress.ip_address(asterisk_host)
+                            asterisk_host_is_ip = True
+                        except Exception:
+                            asterisk_host_is_ip = False
+
+                        # If `asterisk.host` is a hostname, we cannot safely auto-allowlist (DNS changes / ambiguity).
+                        # Require explicit IP allowlist to prevent first-packet hijack.
+                        if not asterisk_host_is_ip and not allowed_list:
+                            errors.append(
+                                "external_media.allowed_remote_hosts is required when asterisk.host is a hostname; "
+                                "set it to one or more IP addresses allowed to send RTP (e.g., your Asterisk server IP)."
+                            )
+
+                        # Validate allowlist entries are IP literals (RTP source address is always an IP).
+                        for entry in allowed_list:
+                            try:
+                                ipaddress.ip_address(entry)
+                            except Exception:
+                                errors.append(
+                                    f"external_media.allowed_remote_hosts contains non-IP entry '{entry}'; "
+                                    "use IP literals only (e.g., '192.0.2.10')."
+                                )
+                except Exception as e:
+                    logger.debug("ExternalMedia allowlist validation failed", error=str(e))
+                
+                # Optional: downstream_mode hint for ExternalMedia + pipelines
+                if has_pipelines:
+                    downstream_mode = getattr(config, "downstream_mode", "file")
+                    if downstream_mode != "file":
+                        warnings.append(
+                            f"ExternalMedia + pipelines: downstream_mode='{downstream_mode}' enabled; "
+                            "pipelines will stream playback when possible and fall back to file playback on errors"
+                        )
+
+            # default_provider-specific key hints (warnings only)
+            default_provider = getattr(config, "default_provider", None)
+            if default_provider == "google_live" and not has_google:
+                warnings.append(
+                    "default_provider='google_live' but GOOGLE_API_KEY is not set; "
+                    "Google Live provider will fail to connect"
+                )
+        except Exception as e:
+            logger.debug("Transport/provider compatibility checks failed", error=str(e))
+    
+    except Exception as e:
+        # Don't let validation errors crash startup
+        logger.warning("Configuration validation encountered an error", error=str(e), exc_info=True)
+        warnings.append(f"Validation check failed: {str(e)}")
+    
+    return errors, warnings

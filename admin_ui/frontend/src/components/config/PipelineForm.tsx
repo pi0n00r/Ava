@@ -1,0 +1,784 @@
+import React, { useState, useEffect } from 'react';
+import { FormInput, FormLabel, FormSwitch, FormSelect } from '../ui/FormComponents';
+import { ensureModularKey, isFullAgentProvider, isRegisteredProvider, capabilityFromKey } from '../../utils/providerNaming';
+import { getSttStreamingMode } from '../../utils/sttAudioContract';
+import { CheckCircle, AlertCircle, Loader2 } from 'lucide-react';
+
+interface LocalAIStatus {
+    stt_backend?: string;
+    stt_model?: string;
+    tts_backend?: string;
+    tts_voice?: string;
+    llm_model?: string;
+    healthy?: boolean;
+}
+
+interface PipelineFormProps {
+    config: any;
+    providers: any;
+    onChange: (newConfig: any) => void;
+    isNew?: boolean;
+}
+
+const parseMarkerList = (value: string) =>
+    (value || '')
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0);
+
+const renderMarkerList = (value: any) =>
+    (Array.isArray(value) ? value : []).join('\n');
+
+const PipelineForm: React.FC<PipelineFormProps> = ({ config, providers, onChange, isNew }) => {
+    const [localConfig, setLocalConfig] = useState<any>({ ...config });
+    const [localAIStatus, setLocalAIStatus] = useState<LocalAIStatus | null>(null);
+    const [statusLoading, setStatusLoading] = useState(false);
+    const [showAdvancedSTT, setShowAdvancedSTT] = useState(false);
+    const [showLlmExpert, setShowLlmExpert] = useState<boolean>(
+        () => config?.options?.llm?.tools_enabled !== undefined || Boolean(config?.options?.llm?.realtime_model) || config?.options?.llm?.aggregation_min_words !== undefined || config?.options?.llm?.aggregation_min_chars !== undefined
+    );
+    const [showSttExpert, setShowSttExpert] = useState<boolean>(
+        () => (Array.isArray(config?.options?.stt?.timestamp_granularities) && config.options.stt.timestamp_granularities.length > 0)
+            || config?.options?.stt?.segment_energy_threshold !== undefined
+            || config?.options?.stt?.segment_silence_ms !== undefined
+    );
+    const [showTtsExpert, setShowTtsExpert] = useState<boolean>(
+        () => config?.options?.tts?.response_format !== undefined || config?.options?.tts?.max_input_chars !== undefined
+    );
+
+    // Fetch local AI server status for backend info (AAVA-116)
+    useEffect(() => {
+        const fetchLocalAIStatus = async () => {
+            setStatusLoading(true);
+            try {
+                const response = await fetch('/api/local-ai/status');
+                if (response.ok) {
+                    const data = await response.json();
+                    setLocalAIStatus(data);
+                }
+            } catch (error) {
+                console.error('Failed to fetch local AI status:', error);
+            } finally {
+                setStatusLoading(false);
+            }
+        };
+        fetchLocalAIStatus();
+    }, []);
+
+    useEffect(() => {
+        setLocalConfig({ ...config });
+    }, [config]);
+
+    useEffect(() => {
+        if (config?.options?.llm?.tools_enabled !== undefined || config?.options?.llm?.realtime_model || config?.options?.llm?.aggregation_min_words !== undefined || config?.options?.llm?.aggregation_min_chars !== undefined) {
+            setShowLlmExpert(true);
+        }
+    }, [config?.options?.llm?.tools_enabled, config?.options?.llm?.realtime_model, config?.options?.llm?.aggregation_min_words, config?.options?.llm?.aggregation_min_chars]);
+
+    useEffect(() => {
+        if ((Array.isArray(config?.options?.stt?.timestamp_granularities) && config.options.stt.timestamp_granularities.length > 0)
+            || config?.options?.stt?.vad_silence_ms !== undefined
+            || config?.options?.stt?.variant !== undefined
+            || config?.options?.stt?.vad_silence_timeout_ms !== undefined
+            || config?.options?.stt?.segment_energy_threshold !== undefined
+            || config?.options?.stt?.segment_silence_ms !== undefined) {
+            setShowSttExpert(true);
+        }
+    }, [config?.options?.stt?.timestamp_granularities, config?.options?.stt?.vad_silence_ms, config?.options?.stt?.variant, config?.options?.stt?.vad_silence_timeout_ms, config?.options?.stt?.segment_energy_threshold, config?.options?.stt?.segment_silence_ms]);
+
+    useEffect(() => {
+        if (config?.options?.tts?.response_format !== undefined || config?.options?.tts?.max_input_chars !== undefined) {
+            setShowTtsExpert(true);
+        }
+    }, [config?.options?.tts?.response_format, config?.options?.tts?.max_input_chars]);
+
+    const updateConfig = (updates: any) => {
+        const newConfig = { ...localConfig, ...updates };
+        setLocalConfig(newConfig);
+        onChange(newConfig);
+    };
+
+    const updateSTTOptions = (updates: any) => {
+        const existingOptions = localConfig.options || {};
+        const existingSTT = existingOptions.stt || {};
+        const nextSTT = { ...existingSTT, ...updates };
+        updateConfig({ options: { ...existingOptions, stt: nextSTT } });
+    };
+
+    const updateRoleOptions = (role: 'stt' | 'llm' | 'tts', updates: any) => {
+        const existingOptions = localConfig.options || {};
+        const existingRole = existingOptions[role] || {};
+        const nextRole = { ...existingRole, ...updates };
+        updateConfig({ options: { ...existingOptions, [role]: nextRole } });
+    };
+
+    const setRoleOptions = (role: 'stt' | 'llm' | 'tts', nextRole: any) => {
+        const existingOptions = localConfig.options || {};
+        const nextOptions = { ...existingOptions };
+        const roleObj = (nextRole && typeof nextRole === 'object') ? nextRole : {};
+        if (Object.keys(roleObj).length === 0) {
+            delete nextOptions[role];
+        } else {
+            nextOptions[role] = roleObj;
+        }
+        updateConfig({ options: nextOptions });
+    };
+
+    // Helper to filter providers by capability
+    // Prefer capabilities array (authoritative). For legacy configs missing capabilities, infer from key suffix.
+    // Only show registered providers that have engine adapter support.
+    const getProvidersByCapability = (cap: 'stt' | 'llm' | 'tts', selectedProvider?: string) => {
+        const isRegisteredOrInferred = (providerKey: string, provider: any) => {
+            if (isRegisteredProvider(provider)) return true;
+            // Legacy configs may omit `type`. Infer registration from the provider key prefix.
+            // This preserves pipeline editability for older YAML and prevents "provider disappears" UX.
+            const k = (providerKey || '').toLowerCase();
+            if (k.startsWith('local')) return true;
+            if (k.startsWith('openai')) return true;
+            if (k.startsWith('groq')) return true;
+            if (k.startsWith('google')) return true;
+            if (k.startsWith('ollama')) return true;
+            if (k.startsWith('elevenlabs')) return true;
+            if (k.startsWith('telnyx') || k.startsWith('telenyx')) return true;
+            return false;
+        };
+
+        const base = Object.entries(providers || {})
+            .filter(([providerKey, p]: [string, any]) => {
+                // Exclude Full Agents from modular slots
+                if (isFullAgentProvider(p, providerKey)) return false;
+
+                // Exclude unregistered providers (no engine adapter)
+                if (!isRegisteredOrInferred(providerKey, p)) return false;
+
+                // Hide disabled providers from choices (but keep them visible if currently selected).
+                if (p.enabled === false) return false;
+
+                const caps = Array.isArray(p.capabilities) ? p.capabilities : [];
+                if (caps.length > 0) {
+                    return caps.includes(cap);
+                }
+
+                // Legacy: infer from provider key suffix (e.g., openai_stt/openai_llm/openai_tts).
+                // This keeps pipelines editable even if capabilities haven't been persisted yet.
+                return capabilityFromKey(providerKey) === cap;
+            })
+            .map(([name, p]: [string, any]) => ({
+                value: name,
+                label: (Array.isArray(p.capabilities) && p.capabilities.length > 0) ? name : `${name} (inferred)`,
+                disabled: false
+            }));
+
+        // If the current pipeline references a disabled provider, keep it visible as the selected value
+        // so users understand why audio may be failing.
+        if (selectedProvider && !base.some((p) => p.value === selectedProvider)) {
+            const selectedCfg = providers?.[selectedProvider];
+            if (selectedCfg && selectedCfg.enabled === false) {
+                const caps = Array.isArray(selectedCfg.capabilities) ? selectedCfg.capabilities : [];
+                const matches =
+                    (caps.length > 0 && caps.includes(cap)) ||
+                    (caps.length === 0 && capabilityFromKey(selectedProvider) === cap);
+                if (matches) {
+                    base.unshift({ value: selectedProvider, label: `${selectedProvider} (Disabled)`, disabled: true });
+                }
+            }
+        }
+
+        return base;
+    };
+
+    const sttProviders = getProvidersByCapability('stt', localConfig.stt);
+    const llmProviders = getProvidersByCapability('llm', localConfig.llm);
+    const ttsProviders = getProvidersByCapability('tts', localConfig.tts);
+
+    const handleProviderChange = (cap: 'stt' | 'llm' | 'tts', value: string) => {
+        if (!value) {
+            // If a component is cleared, also clear its option overrides (otherwise stale base_url/model can linger).
+            const existingOptions = localConfig.options || {};
+            const nextOptions = { ...existingOptions };
+            if (cap === 'llm' && nextOptions.llm) {
+                delete nextOptions.llm;
+            }
+            updateConfig({ [cap]: '', options: nextOptions });
+            return;
+        }
+        const normalized = ensureModularKey(value, cap);
+
+        // IMPORTANT: When switching LLM providers, clear any pipeline-level LLM overrides.
+        // Otherwise, users can end up with an Ollama adapter pointed at an OpenAI base_url (causing 404s).
+        const updates: any = { [cap]: normalized };
+        if (cap === 'llm' && normalized !== localConfig.llm) {
+            const existingOptions = localConfig.options || {};
+            const nextOptions = { ...existingOptions };
+            if (nextOptions.llm) {
+                delete nextOptions.llm;
+            }
+            updates.options = nextOptions;
+        }
+
+        updateConfig(updates);
+    };
+
+    const sttKey = String(localConfig.stt || '').toLowerCase();
+    const llmKey = String(localConfig.llm || '').toLowerCase();
+    const ttsKey = String(localConfig.tts || '').toLowerCase();
+
+    const isOpenAIStt = sttKey.includes('openai');
+    const isLocalStt = sttKey.includes('local');
+    const isOpenAILlm = llmKey.includes('openai');
+    const isOpenAITts = ttsKey.includes('openai');
+    const isGroqStt = sttKey.includes('groq');
+    const isGroqTts = ttsKey.includes('groq');
+    const isOllamaLlm = llmKey.includes('ollama');
+    const isAzureStt = sttKey.includes('azure');
+    const isAzureTts = ttsKey.includes('azure');
+    const sttStreamingMode = getSttStreamingMode(sttKey, providers || {});
+    const sttStreamingEnabled = sttStreamingMode === 'required'
+        || (sttStreamingMode === 'optional' && (localConfig.options?.stt?.streaming ?? true));
+
+    const timestampGranularities = Array.isArray(localConfig.options?.stt?.timestamp_granularities)
+        ? localConfig.options?.stt?.timestamp_granularities
+        : [];
+    const timestampGranularitiesText = timestampGranularities.join(', ');
+
+    const guardrailEnabledValue =
+        localConfig.options?.llm?.hangup_call_guardrail === true
+            ? 'true'
+            : localConfig.options?.llm?.hangup_call_guardrail === false
+                ? 'false'
+                : '';
+
+    const guardrailModeValue = String(localConfig.options?.llm?.hangup_call_guardrail_mode || '');
+    const streamingOverlapValue = localConfig.options?.tts?.streaming_overlap === true
+        ? 'true'
+        : localConfig.options?.tts?.streaming_overlap === false
+            ? 'false'
+            : '';
+    const guardrailMarkersValue = localConfig.options?.llm?.hangup_call_guardrail_markers?.end_call;
+    const guardrailMarkersText = renderMarkerList(guardrailMarkersValue);
+    const [guardrailMarkersDraft, setGuardrailMarkersDraft] = useState<string>(guardrailMarkersText);
+
+    useEffect(() => {
+        setGuardrailMarkersDraft(guardrailMarkersText);
+    }, [guardrailMarkersText]);
+
+    return (
+        <div className="space-y-6">
+            <div className="space-y-4 border-b border-border pb-6">
+                <h4 className="font-semibold">Pipeline Identity</h4>
+                <FormInput
+                    label="Pipeline Name"
+                    value={localConfig.name || ''}
+                    onChange={(e) => updateConfig({ name: e.target.value })}
+                    placeholder="e.g., english_support"
+                    disabled={!isNew}
+                    tooltip="Unique identifier for this pipeline."
+                />
+            </div>
+
+            <div className="space-y-4">
+                <h4 className="font-semibold">Components</h4>
+
+                <div className="space-y-2">
+                    <FormLabel>Speech-to-Text (STT)</FormLabel>
+                    <select
+                        className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                        value={localConfig.stt || ''}
+                        onChange={(e) => handleProviderChange('stt', e.target.value)}
+                    >
+                        <option value="">Select STT Provider...</option>
+                        {sttProviders.map(p => (
+                            <option key={p.value} value={p.value} disabled={p.disabled}>
+                                {p.label} {p.disabled ? '(Disabled)' : ''}
+                            </option>
+                        ))}
+                    </select>
+                    {/* AAVA-116: Show active backend for local_stt */}
+                    {localConfig.stt?.includes('local') && localAIStatus && (
+                        <div className="flex items-center gap-2 text-xs text-muted-foreground bg-muted/50 px-3 py-2 rounded-md">
+                            {statusLoading ? (
+                                <Loader2 className="h-3 w-3 animate-spin" />
+                            ) : localAIStatus.healthy ? (
+                                <CheckCircle className="h-3 w-3 text-green-500" />
+                            ) : (
+                                <AlertCircle className="h-3 w-3 text-yellow-500" />
+                            )}
+                            <span>
+                                Active Backend: <strong className="text-foreground">{localAIStatus.stt_backend || 'Unknown'}</strong>
+                                {localAIStatus.stt_model && <span className="text-muted-foreground"> ({localAIStatus.stt_model})</span>}
+                            </span>
+                        </div>
+                    )}
+                    {sttProviders.length === 0 && (
+                        <p className="text-xs text-destructive">No STT providers available. Create a modular STT provider first.</p>
+                    )}
+                </div>
+
+                <div className="space-y-3">
+                    {sttStreamingMode === 'buffered' ? (
+                        <div className="rounded-lg border border-border bg-card/50 p-3 text-sm">
+                            <div className="font-medium">Buffered STT</div>
+                            <p className="mt-1 text-xs text-muted-foreground">
+                                This adapter receives complete PCM16 audio buffers with the sample rate supplied by the engine.
+                            </p>
+                        </div>
+                    ) : (
+                        <FormSwitch
+                            id="pipeline-stt-streaming"
+                            label="Streaming STT"
+                            checked={sttStreamingEnabled}
+                            disabled={sttStreamingMode === 'required'}
+                            onChange={(e) => updateSTTOptions({ streaming: e.target.checked })}
+                            description={sttStreamingMode === 'required'
+                                ? 'Required by this STT adapter.'
+                                : 'Recommended. Enables low-latency, two-way conversation.'}
+                            tooltip="Streaming adapters receive the engine-managed PCM16 mono 16 kHz audio bus."
+                        />
+                    )}
+
+                    <div className="flex items-center justify-between">
+                        <button
+                            type="button"
+                            className="text-xs text-primary hover:underline"
+                            onClick={() => setShowAdvancedSTT((v) => !v)}
+                        >
+                            {showAdvancedSTT ? 'Hide Advanced' : 'Show Advanced'}
+                        </button>
+                        <div className="text-xs text-muted-foreground">
+                            {sttStreamingEnabled
+                                ? 'Engine input: PCM16-LE · mono · 16 kHz'
+                                : 'Buffered input: engine-described PCM16'}
+                        </div>
+                    </div>
+
+                    {showAdvancedSTT && (
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <FormInput
+                                label="chunk_ms"
+                                type="number"
+                                value={localConfig.options?.stt?.chunk_ms ?? 160}
+                                onChange={(e) => updateSTTOptions({ chunk_ms: parseInt(e.target.value || '160', 10) })}
+                                tooltip={sttStreamingEnabled
+                                    ? 'How often accumulated frames are sent to streaming STT. Flux recommends 80ms; other adapters default to 160ms.'
+                                    : 'How much audio is buffered before a transcription request.'}
+                            />
+                            {sttStreamingEnabled && (
+                                <div className="space-y-2">
+                                    <FormLabel>Streaming audio format</FormLabel>
+                                    <div className="rounded-md border border-input bg-muted/40 px-3 py-2 text-sm font-mono">
+                                        pcm16_16k · linear16 · mono
+                                    </div>
+                                    <p className="text-xs text-muted-foreground">
+                                        Managed by the engine so provider metadata always matches the audio bytes.
+                                    </p>
+                                </div>
+                            )}
+                        </div>
+                    )}
+                </div>
+
+                <div className="space-y-2">
+                    <FormLabel>Large Language Model (LLM)</FormLabel>
+                    <select
+                        className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                        value={localConfig.llm || ''}
+                        onChange={(e) => handleProviderChange('llm', e.target.value)}
+                    >
+                        <option value="">Select LLM Provider...</option>
+                        {llmProviders.map(p => (
+                            <option key={p.value} value={p.value} disabled={p.disabled}>
+                                {p.label} {p.disabled ? '(Disabled)' : ''}
+                            </option>
+                        ))}
+                    </select>
+                    {llmProviders.length === 0 && (
+                        <p className="text-xs text-destructive">No LLM providers available. Create a modular LLM provider first.</p>
+                    )}
+                </div>
+
+                <div className="space-y-2">
+                    <FormLabel>Text-to-Speech (TTS)</FormLabel>
+                    <select
+                        className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                        value={localConfig.tts || ''}
+                        onChange={(e) => handleProviderChange('tts', e.target.value)}
+                    >
+                        <option value="">Select TTS Provider...</option>
+                        {ttsProviders.map(p => (
+                            <option key={p.value} value={p.value} disabled={p.disabled}>
+                                {p.label} {p.disabled ? '(Disabled)' : ''}
+                            </option>
+                        ))}
+                    </select>
+                    {/* AAVA-116: Show active backend for local_tts */}
+                    {localConfig.tts?.includes('local') && localAIStatus && (
+                        <div className="flex items-center gap-2 text-xs text-muted-foreground bg-muted/50 px-3 py-2 rounded-md">
+                            {statusLoading ? (
+                                <Loader2 className="h-3 w-3 animate-spin" />
+                            ) : localAIStatus.healthy ? (
+                                <CheckCircle className="h-3 w-3 text-green-500" />
+                            ) : (
+                                <AlertCircle className="h-3 w-3 text-yellow-500" />
+                            )}
+                            <span>
+                                Active Backend: <strong className="text-foreground">{localAIStatus.tts_backend || 'Unknown'}</strong>
+                                {localAIStatus.tts_voice && <span className="text-muted-foreground"> ({localAIStatus.tts_voice})</span>}
+                            </span>
+                        </div>
+                    )}
+                    {ttsProviders.length === 0 && (
+                        <p className="text-xs text-destructive">No TTS providers available. Create a modular TTS provider first.</p>
+                    )}
+                </div>
+            </div>
+
+            <div className="space-y-4 border-t border-border pt-6">
+                {(isOpenAILlm || isOllamaLlm) && (
+                    <div className="space-y-3 border border-amber-300/40 rounded-lg p-4 bg-amber-500/5">
+                        <FormSwitch
+                            label="LLM Expert Settings"
+                            description="Expose high-impact LLM adapter overrides."
+                            checked={showLlmExpert}
+                            onChange={(e) => setShowLlmExpert(e.target.checked)}
+                            className="mb-0 border-0 p-0 bg-transparent"
+                        />
+                        <p className={`text-xs ${showLlmExpert ? 'text-amber-700 dark:text-amber-400' : 'text-muted-foreground'}`}>
+                            {showLlmExpert
+                                ? 'Warning: LLM expert overrides can break tool-calling behavior if they diverge from provider defaults.'
+                                : 'Expert values are visible and read-only until LLM expert mode is enabled.'}
+                        </p>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <FormSwitch
+                                label="LLM Tools Enabled"
+                                description="Allow tool calls at the pipeline adapter level."
+                                checked={localConfig.options?.llm?.tools_enabled ?? true}
+                                onChange={(e) => updateRoleOptions('llm', { tools_enabled: e.target.checked })}
+                                disabled={!showLlmExpert}
+                            />
+                            {isOpenAILlm && (
+                                <FormInput
+                                    label="OpenAI Realtime Model"
+                                    value={localConfig.options?.llm?.realtime_model || ''}
+                                    onChange={(e) => updateRoleOptions('llm', { realtime_model: e.target.value })}
+                                    placeholder="gpt-realtime"
+                                    tooltip="Adapter-level realtime model override for OpenAI pipeline LLM. Current GA aliases: gpt-realtime (default), gpt-realtime-1.5, gpt-realtime-2, gpt-realtime-mini. Legacy gpt-4o-realtime-preview-* values were removed by OpenAI on 2026-05-07."
+                                    disabled={!showLlmExpert}
+                                />
+                            )}
+                            <FormInput
+                                label="LLM Min Words Threshold"
+                                type="number"
+                                min={1}
+                                step={1}
+                                value={localConfig.options?.llm?.aggregation_min_words ?? ''}
+                                onChange={(e) => {
+                                    const raw = e.target.value;
+                                    if (!raw) { updateRoleOptions('llm', { aggregation_min_words: undefined }); return; }
+                                    const parsed = parseInt(raw, 10);
+                                    if (Number.isFinite(parsed)) { updateRoleOptions('llm', { aggregation_min_words: Math.max(1, parsed) }); }
+                                }}
+                                placeholder="Auto"
+                                tooltip="Minimum words to wait before sending transcript to LLM."
+                                disabled={!showLlmExpert}
+                            />
+                            <FormInput
+                                label="LLM Min Chars Threshold"
+                                type="number"
+                                min={1}
+                                step={1}
+                                value={localConfig.options?.llm?.aggregation_min_chars ?? ''}
+                                onChange={(e) => {
+                                    const raw = e.target.value;
+                                    if (!raw) { updateRoleOptions('llm', { aggregation_min_chars: undefined }); return; }
+                                    const parsed = parseInt(raw, 10);
+                                    if (Number.isFinite(parsed)) { updateRoleOptions('llm', { aggregation_min_chars: Math.max(1, parsed) }); }
+                                }}
+                                placeholder="Auto"
+                                tooltip="Minimum characters to wait before sending transcript to LLM."
+                                disabled={!showLlmExpert}
+                            />
+                        </div>
+                        <div className="mt-2 border-t border-amber-300/30 pt-3 space-y-3">
+                            <p className="text-xs text-muted-foreground">
+                                Hangup guardrails apply to pipeline LLMs that emit <code>hangup_call</code> too eagerly. These settings are per-pipeline and do not affect full-agent providers like Google Live.
+                            </p>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <FormSelect
+                                    label="Hangup Call Guardrail"
+                                    value={guardrailEnabledValue}
+                                    onChange={(e) => {
+                                        const v = String(e.target.value || '');
+                                        if (!v) {
+                                            const next = { ...(localConfig.options?.llm || {}) };
+                                            delete next.hangup_call_guardrail;
+                                            setRoleOptions('llm', next);
+                                            return;
+                                        }
+                                        updateRoleOptions('llm', { hangup_call_guardrail: v === 'true' });
+                                    }}
+                                    tooltip="Auto: enabled only for specific adapters (e.g., Ollama) unless explicitly set. When enabled, hangup_call is allowed only if user end-of-call intent is detected from text."
+                                    options={[
+                                        { value: '', label: 'Auto (default)' },
+                                        { value: 'true', label: 'Enabled' },
+                                        { value: 'false', label: 'Disabled' },
+                                    ]}
+                                    disabled={!showLlmExpert}
+                                />
+                                <FormSelect
+                                    label="Hangup Guardrail Mode"
+                                    value={guardrailModeValue}
+                                    onChange={(e) => {
+                                        const v = String(e.target.value || '');
+                                        if (!v) {
+                                            const next = { ...(localConfig.options?.llm || {}) };
+                                            delete next.hangup_call_guardrail_mode;
+                                            setRoleOptions('llm', next);
+                                            return;
+                                        }
+                                        updateRoleOptions('llm', { hangup_call_guardrail_mode: v });
+                                    }}
+                                    tooltip="Auto uses the global hangup policy mode. Relaxed disables the guardrail, Strict forces it on, Normal uses adapter defaults unless explicitly enabled/disabled above."
+                                    options={[
+                                        { value: '', label: 'Auto (global)' },
+                                        { value: 'relaxed', label: 'Relaxed' },
+                                        { value: 'normal', label: 'Normal' },
+                                        { value: 'strict', label: 'Strict' },
+                                    ]}
+                                    disabled={!showLlmExpert}
+                                />
+                            </div>
+                            <div className="space-y-2">
+                                <FormLabel tooltip="Per-pipeline override list of caller phrases that indicate they want to end the call. Leave empty to use the global defaults from the Hangup tool policy.">
+                                    End-Call Intent Markers (Override)
+                                </FormLabel>
+                                <textarea
+                                    className="w-full p-2 rounded border border-input bg-background text-sm min-h-[120px] disabled:cursor-not-allowed disabled:opacity-50"
+                                    value={guardrailMarkersDraft}
+                                    onChange={(e) => {
+                                        setGuardrailMarkersDraft(e.target.value);
+                                    }}
+                                    onBlur={() => {
+                                        const items = parseMarkerList(guardrailMarkersDraft);
+                                        if (items.length === 0) {
+                                            const next = { ...(localConfig.options?.llm || {}) };
+                                            if (next.hangup_call_guardrail_markers && typeof next.hangup_call_guardrail_markers === 'object') {
+                                                const nextMarkers = { ...(next.hangup_call_guardrail_markers || {}) };
+                                                delete nextMarkers.end_call;
+                                                if (Object.keys(nextMarkers).length === 0) {
+                                                    delete next.hangup_call_guardrail_markers;
+                                                } else {
+                                                    next.hangup_call_guardrail_markers = nextMarkers;
+                                                }
+                                            }
+                                            setRoleOptions('llm', next);
+                                            return;
+                                        }
+                                        updateRoleOptions('llm', {
+                                            hangup_call_guardrail_markers: {
+                                                ...(localConfig.options?.llm?.hangup_call_guardrail_markers || {}),
+                                                end_call: items,
+                                            },
+                                        });
+                                    }}
+                                    disabled={!showLlmExpert}
+                                />
+                                <p className="text-xs text-muted-foreground">
+                                    One phrase per line. Keep this list short to reduce false positives.
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {(isOpenAIStt || isGroqStt || isAzureStt || isLocalStt) && (
+                    <div className="space-y-3 border border-amber-300/40 rounded-lg p-4 bg-amber-500/5">
+                        <FormSwitch
+                            label="STT Expert Settings"
+                            description="Expose advanced STT adapter options."
+                            checked={showSttExpert}
+                            onChange={(e) => setShowSttExpert(e.target.checked)}
+                            className="mb-0 border-0 p-0 bg-transparent"
+                        />
+                        <p className={`text-xs ${showSttExpert ? 'text-amber-700 dark:text-amber-400' : 'text-muted-foreground'}`}>
+                            {showSttExpert
+                                ? 'Warning: unsupported timestamp settings can fail transcription requests on some models.'
+                                : 'Expert values are visible and read-only until STT expert mode is enabled.'}
+                        </p>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            {(isOpenAIStt || isGroqStt) && (
+                                <FormInput
+                                    label="STT Timestamp Granularities"
+                                    value={timestampGranularitiesText}
+                                    onChange={(e) =>
+                                        updateRoleOptions('stt', {
+                                            timestamp_granularities: (e.target.value || '')
+                                                .split(',')
+                                                .map((v) => v.trim())
+                                                .filter(Boolean),
+                                        })
+                                    }
+                                    placeholder="segment, word"
+                                    tooltip="Comma-separated; only supported on specific models/endpoints."
+                                    disabled={!showSttExpert}
+                                />
+                            )}
+                            {isAzureStt && (
+                                <>
+                                    <div className="space-y-1">
+                                        <label className="text-sm font-medium">Azure STT Variant Override</label>
+                                        <select
+                                            className="w-full p-2 rounded border border-input bg-background text-sm"
+                                            value={localConfig.options?.stt?.variant || ''}
+                                            onChange={(e) => updateRoleOptions('stt', { variant: e.target.value || undefined })}
+                                            disabled={!showSttExpert}
+                                        >
+                                            <option value="">Use provider default</option>
+                                            <option value="realtime">realtime</option>
+                                            <option value="fast">fast</option>
+                                        </select>
+                                        <p className="text-xs text-muted-foreground">Override the variant set on the provider.</p>
+                                    </div>
+                                    <FormInput
+                                        label="Azure STT Language Override"
+                                        value={localConfig.options?.stt?.language || ''}
+                                        onChange={(e) => updateRoleOptions('stt', { language: e.target.value || undefined })}
+                                        placeholder="en-US"
+                                        tooltip="Override the BCP-47 locale for this pipeline slot."
+                                        disabled={!showSttExpert}
+                                    />
+                                </>
+                            )}
+                            {isLocalStt && (
+                                <>
+                                    <FormInput
+                                        label="Local STT Energy Threshold"
+                                        type="number"
+                                        value={localConfig.options?.stt?.segment_energy_threshold ?? ''}
+                                        onChange={(e) => {
+                                            const value = e.target.value;
+                                            updateRoleOptions('stt', {
+                                                segment_energy_threshold: value === '' ? undefined : parseInt(value, 10),
+                                            });
+                                        }}
+                                        placeholder="1200 (server default)"
+                                        tooltip="Per-pipeline Whisper speech threshold (0–32767). Lower values retain quieter phonemes but can admit noise."
+                                        min={0}
+                                        max={32767}
+                                        disabled={!showSttExpert}
+                                    />
+                                    <FormInput
+                                        label="Local STT End Silence (ms)"
+                                        type="number"
+                                        value={localConfig.options?.stt?.segment_silence_ms ?? ''}
+                                        onChange={(e) => {
+                                            const value = e.target.value;
+                                            updateRoleOptions('stt', {
+                                                segment_silence_ms: value === '' ? undefined : parseInt(value, 10),
+                                            });
+                                        }}
+                                        placeholder="500 (server default)"
+                                        tooltip="Per-pipeline Whisper end-of-utterance silence (100–5000 ms). Longer values reduce phrase fragmentation but add turn latency."
+                                        min={100}
+                                        max={5000}
+                                        disabled={!showSttExpert}
+                                    />
+                                </>
+                            )}
+                        </div>
+                    </div>
+                )}
+
+                {localConfig.tts && (
+                    <div className="space-y-3 border border-border rounded-lg p-4">
+                        <h4 className="font-semibold">TTS Playback Policy</h4>
+                        <FormSelect
+                            label="Streaming Overlap"
+                            value={streamingOverlapValue}
+                            onChange={(e) => {
+                                const value = String(e.target.value || '');
+                                if (!value) {
+                                    const next = { ...(localConfig.options?.tts || {}) };
+                                    delete next.streaming_overlap;
+                                    setRoleOptions('tts', next);
+                                    return;
+                                }
+                                updateRoleOptions('tts', { streaming_overlap: value === 'true' });
+                            }}
+                            tooltip="Inherit uses the global pipeline setting. Disable per pipeline to synthesize the complete response before playback; this can avoid sentence-boundary starvation at the cost of higher first-audio latency."
+                            options={[
+                                { value: '', label: 'Inherit global (default)' },
+                                { value: 'true', label: 'Enabled (lower latency)' },
+                                { value: 'false', label: 'Disabled (complete response)' },
+                            ]}
+                        />
+                        <p className="text-xs text-muted-foreground">
+                            This override affects only this pipeline. Leave it inherited unless diagnosing playback gaps.
+                        </p>
+                    </div>
+                )}
+
+                {(isOpenAITts || isGroqTts || isAzureTts) && (
+                    <div className="space-y-3 border border-amber-300/40 rounded-lg p-4 bg-amber-500/5">
+                        <FormSwitch
+                            label="TTS Expert Settings"
+                            description="Expose provider-specific TTS adapter overrides."
+                            checked={showTtsExpert}
+                            onChange={(e) => setShowTtsExpert(e.target.checked)}
+                            className="mb-0 border-0 p-0 bg-transparent"
+                        />
+                        <p className={`text-xs ${showTtsExpert ? 'text-amber-700 dark:text-amber-400' : 'text-muted-foreground'}`}>
+                            {showTtsExpert
+                                ? 'Warning: TTS expert overrides can change output encoding/chunking and impact call playback.'
+                                : 'Expert values are visible and read-only until TTS expert mode is enabled.'}
+                        </p>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            {isOpenAITts && (
+                                <FormInput
+                                    label="OpenAI TTS Response Format"
+                                    value={localConfig.options?.tts?.response_format || ''}
+                                    onChange={(e) => updateRoleOptions('tts', { response_format: e.target.value })}
+                                    placeholder="wav"
+                                    tooltip="Adapter response format (e.g., wav, pcm)."
+                                    disabled={!showTtsExpert}
+                                />
+                            )}
+                            {isGroqTts && (
+                                <FormInput
+                                    label="Groq TTS Max Input Chars"
+                                    type="number"
+                                    value={localConfig.options?.tts?.max_input_chars ?? 200}
+                                    onChange={(e) => updateRoleOptions('tts', { max_input_chars: parseInt(e.target.value || '200', 10) })}
+                                    tooltip="Max characters per TTS chunk before adapter splits text."
+                                    disabled={!showTtsExpert}
+                                />
+                            )}
+                            {isAzureTts && (
+                                <>
+                                    <FormInput
+                                        label="Azure TTS Voice Name Override"
+                                        value={localConfig.options?.tts?.voice_name || ''}
+                                        onChange={(e) => updateRoleOptions('tts', { voice_name: e.target.value || undefined })}
+                                        placeholder="en-US-JennyNeural"
+                                        tooltip="Override the neural voice name for this pipeline slot."
+                                        disabled={!showTtsExpert}
+                                    />
+                                    <FormInput
+                                        label="Azure TTS Output Format Override"
+                                        value={localConfig.options?.tts?.output_format || ''}
+                                        onChange={(e) => updateRoleOptions('tts', { output_format: e.target.value || undefined })}
+                                        placeholder="riff-8khz-16bit-mono-pcm"
+                                        tooltip="Override the Azure output format for this pipeline slot."
+                                        disabled={!showTtsExpert}
+                                    />
+                                </>
+                            )}
+                        </div>
+                    </div>
+                )}
+            </div>
+
+        </div>
+    );
+};
+
+export default PipelineForm;

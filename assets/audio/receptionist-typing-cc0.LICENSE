@@ -1,0 +1,19 @@
+SPDX-License-Identifier: CC0-1.0
+
+The receptionist typing waveform is derived from "Keyboard typing" by
+Breviceps, Freesound sound 447909, published 2018-11-14:
+https://freesound.org/people/Breviceps/sounds/447909/
+
+The creator published the recording under Creative Commons Zero (CC0 1.0),
+dedicating it to the public domain. CC0 permits copying, modification,
+distribution, and commercial use without permission:
+https://creativecommons.org/publicdomain/zero/1.0/
+
+The retrieved high-quality Freesound preview was downmixed to mono, resampled
+to 8,000 Hz, attenuated by 16 dB, and padded to exactly 4.000 seconds for the
+telephone path. The source preview SHA-256 is
+9777520f7b6a68f2b33104ee908437a78c434fb643a3038fab3fbdf235a848c5.
+The transformed WAV SHA-256 is
+db4198f9d1d25748593588b3ceda9079c287873f1e932740914602b82936ac38.
+
+The asset contains no speech or caller identifiers.
