@@ -16379,6 +16379,7 @@ class Engine:
                     # 1. Synthesize and Play Text (if any)
                     # Skip TTS if streaming path already played audio
                     if response_text and not _streaming_handled:
+                        await stop_model_wait()
                         # Resolve effective downstream mode: TTS adapter can override global setting.
                         _tts_dm_override = getattr(pipeline.tts_adapter, "downstream_mode_override", "auto") or "auto"
                         logger.debug(f"TTS Adapter DM Override evaluated as: {_tts_dm_override} on adapter {pipeline.tts_adapter.__class__.__name__}")
