@@ -6,11 +6,13 @@ import time
 import uuid
 from types import SimpleNamespace
 
+import aiohttp
 import pytest
 
 from src.audio.audiosocket_server import AudioSocketServer, TYPE_AUDIO, TYPE_TERMINATE, TYPE_UUID
 from src.config import AppConfig
 from src.core.models import CallSession
+from src.core.pipeline_message_deposit import PipelineMessageDepositGuard
 from src.engine import Engine
 from src.pipelines.base import LLMComponent, LLMResponse, STTComponent, TTSComponent
 from src.tools.http.in_call_lookup import create_in_call_http_tool
@@ -85,6 +87,23 @@ class _DepositLLM(LLMComponent):
             assert self.calls == 1
             assert transcript == "Yes."
         return self._deposit_call()
+
+
+class _NoConfirmationInference(LLMComponent):
+    supports_streaming = True
+
+    def __init__(self):
+        self.calls = 0
+        self.stream_calls = 0
+
+    async def generate(self, *args, **kwargs):
+        self.calls += 1
+        raise AssertionError("confirmed deposit must not start another inference")
+
+    async def generate_stream(self, *args, **kwargs):
+        self.stream_calls += 1
+        raise AssertionError("confirmed deposit must not start streaming inference")
+        yield ""
 
 
 class _RecordingTTS(TTSComponent):
@@ -163,10 +182,26 @@ async def _wait_until(predicate, timeout=3.0):
         await asyncio.sleep(0.01)
 
 
-@pytest.mark.parametrize("via_followup", [False, True], ids=["primary", "followup"])
+@pytest.mark.parametrize(
+    "via_followup,direct_confirmation,outcome",
+    [
+        (False, False, "success"),
+        (True, False, "success"),
+        (False, True, "success"),
+        (False, True, "cancel"),
+        (False, True, "http-failure"),
+        (False, True, "missing-spoken-response"),
+    ],
+    ids=[
+        "legacy-primary", "legacy-followup", "main-direct-confirmation",
+        "main-pending-cancel", "main-http-failure", "main-invalid-direct-result",
+    ],
+)
 @pytest.mark.asyncio
 async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
     via_followup,
+    direct_confirmation,
+    outcome,
     caplog,
     monkeypatch,
     tmp_path,
@@ -177,6 +212,20 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
     preflight_requests = []
     request_seen = asyncio.Event()
     response_at = [0.0]
+    guard_time = [100.0]
+    release_cancelled_http = asyncio.Event()
+    cancelled_http_done = asyncio.Event()
+    failure_phrase = "I'm sorry, I couldn't deposit your message."
+    http_timeout_totals = []
+    if direct_confirmation:
+        native_client_timeout = aiohttp.ClientTimeout
+
+        def recording_client_timeout(*args, **kwargs):
+            value = native_client_timeout(*args, **kwargs)
+            http_timeout_totals.append(value.total)
+            return value
+
+        monkeypatch.setattr(aiohttp, "ClientTimeout", recording_client_timeout)
 
     async def http_handler(reader, writer):
         headers = await reader.readuntil(b"\r\n\r\n")
@@ -192,12 +241,25 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
             payload = json.dumps({"message": "preflight complete"}).encode()
         else:
             requests.append(decoded)
+            if direct_confirmation:
+                assert engine._pipeline_message_deposit_guard().snapshot(call_id)["phase"] == "executing"
+                guard_time[0] += 54.0
             request_seen.set()
+            if outcome == "cancel":
+                await release_cancelled_http.wait()
+                writer.close()
+                await writer.wait_closed()
+                cancelled_http_done.set()
+                return
             await asyncio.sleep(0.36)
             response_at[0] = time.monotonic()
-            payload = json.dumps({"speech": "I'll make sure Gary gets it."}).encode()
+            data = {"spoken_response": "I'll make sure Gary gets it."}
+            if outcome == "missing-spoken-response":
+                data = {"untrusted_result": "Never speak this as success."}
+            payload = json.dumps(data).encode()
+        status_line = b"HTTP/1.1 500 Failed\r\n" if outcome == "http-failure" else b"HTTP/1.1 200 OK\r\n"
         writer.write(
-            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+            status_line + b"Content-Type: application/json\r\nContent-Length: "
             + str(len(payload)).encode()
             + b"\r\nConnection: close\r\n\r\n"
             + payload
@@ -230,8 +292,17 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
     engine.pipeline_orchestrator._started = True
     assert engine.streaming_playback_manager.diag_enable_taps is False
     engine.no_input_watchdog = _Watchdog()
-    stt, llm, tts = _ResultSTT(), _DepositLLM(via_followup=via_followup), _RecordingTTS()
+    stt, tts = _ResultSTT(), _RecordingTTS()
+    llm = _NoConfirmationInference() if direct_confirmation else _DepositLLM(via_followup=via_followup)
     resolution = _Resolution(stt, llm, tts)
+    if direct_confirmation:
+        resolution.llm_options = {
+            "session_user_from_call_id": True,
+            "call_id_header_enabled": True,
+        }
+        engine._pipeline_message_deposit_guard_state = PipelineMessageDepositGuard(clock=lambda: guard_time[0])
+        engine.config.streaming.pipeline_filler_enabled = True
+        engine.config.streaming.pipeline_filler_phrases = ["Filler must not precede dispatch."]
     engine.pipeline_orchestrator.get_pipeline = lambda *args, **kwargs: resolution
     async def set_channel_var(*args, **kwargs):
         return True
@@ -252,7 +323,17 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
     session.context_name = "machine"
     session.allowed_tools = ["deposit_preflight", "pbx_message_deposit"]
     session.audio_capture_enabled = True
+    session.caller_name = "Synthetic caller"
+    session.caller_number = "fixture-callback"
 
+    body_template = '{"target":"{target}","message":"{message}"}'
+    if direct_confirmation:
+        body_template = (
+            '{"target":"{target}","message":"{message}",'
+            '"call_id":"{call_id}","request_id":"{call_id}",'
+            '"caller_name":"{caller_name}","callback_number":"{caller_number}",'
+            '"urgency":"normal","confirmed":true}'
+        )
     tool = create_in_call_http_tool(
         "pbx_message_deposit",
         {
@@ -261,14 +342,15 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
             "url": f"http://127.0.0.1:{http_port}/deposit",
             "method": "POST",
             "headers": {"Content-Type": "application/json"},
-            "body_template": '{"target":"{target}","message":"{message}"}',
+            "body_template": body_template,
             "parameters": [
                 {"name": "target", "type": "string", "required": True},
                 {"name": "message", "type": "string", "required": True},
             ],
-            "direct_response_json_path": "speech",
+            "direct_response_json_path": "spoken_response",
+            "direct_failure_message": failure_phrase,
             "caller_wait_ambience": True,
-            "timeout_ms": 2000,
+            "timeout_ms": 180000 if direct_confirmation else 2000,
         },
     )
     registry = ToolRegistry.isolated()
@@ -390,7 +472,41 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
     start_index = len(outbound_frames)
     await stt.results.put("Yes.")
     await asyncio.wait_for(request_seen.wait(), timeout=5)
-    await _wait_until(lambda: "I'll make sure Gary gets it." in tts.texts)
+    if outcome == "cancel":
+        await _wait_until(lambda: len(outbound_frames) >= start_index + 3)
+        assert engine._pipeline_message_deposit_guard().snapshot(call_id)["phase"] == "executing"
+        assert not engine.streaming_playback_manager.active_streams
+        assert session.audio_capture_enabled is True
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            await engine._cleanup_call(call_id)
+        assert llm.calls == llm.stream_calls == 0
+        assert http_timeout_totals == [180.0]
+        assert len(requests) == 1
+        assert engine._pipeline_message_deposit_guard().snapshot(call_id) is None
+        assert not engine.streaming_playback_manager._caller_wait_ambience_tasks
+        assert not engine.streaming_playback_manager._caller_wait_ambience_stops
+        assert not engine._pipeline_tasks
+        assert "I'll make sure Gary gets it." not in tts.texts
+        assert failure_phrase not in tts.texts
+        assert not [record for record in caplog.records if record.exc_info]
+        assert engine.no_input_watchdog.stopped == [call_id]
+        assert hangup_channels == [call_id]
+        release_cancelled_http.set()
+        await asyncio.wait_for(cancelled_http_done.wait(), timeout=2)
+        writer.write(bytes([TYPE_TERMINATE, 0, 0]))
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+        await audio_server.stop()
+        capture_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await capture_task
+        http_server.close()
+        await http_server.wait_closed()
+        return
+    terminal_phrase = "I'll make sure Gary gets it." if outcome == "success" else failure_phrase
+    await _wait_until(lambda: terminal_phrase in tts.texts)
     await _wait_until(lambda: not engine.streaming_playback_manager.active_streams)
     await _wait_until(lambda: engine.no_input_watchdog.suspensions == [True, False])
     await _wait_until(
@@ -400,10 +516,26 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
         )
     )
 
-    assert requests == [{"target": "Gary", "message": "The sky is blue."}]
+    expected_body = {"target": "Gary", "message": "The sky is blue."}
+    if direct_confirmation:
+        expected_body.update({
+            "call_id": call_id, "request_id": call_id,
+            "caller_name": "Synthetic caller", "callback_number": "fixture-callback",
+            "urgency": "normal", "confirmed": True,
+        })
+        assert tool.config.timeout_ms == 180000
+        assert http_timeout_totals == [180.0]
+        assert engine._pipeline_message_deposit_guard()._confirmed_execution_window_sec == 5.0
+        assert llm.stream_calls == 0
+        assert "Filler must not precede dispatch." not in tts.texts
+    assert requests == [expected_body]
     assert preflight_requests == ([{}] if via_followup else [])
-    assert llm.calls == (2 if via_followup else 1)
-    assert tts.texts.count("I'll make sure Gary gets it.") == 1
+    assert llm.calls == (0 if direct_confirmation else 2 if via_followup else 1)
+    assert tts.texts.count(terminal_phrase) == 1
+    assert "Never speak this as success." not in tts.texts
+    if outcome != "success":
+        assert "I'll make sure Gary gets it." not in tts.texts
+        assert engine._pipeline_message_deposit_guard().snapshot(call_id)["phase"] == "awaiting_confirmation"
     assert engine.no_input_watchdog.suspensions == [True, False]
     wait_frames = [
         (stamp, payload)
@@ -438,9 +570,10 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
     assert not engine.streaming_playback_manager._caller_wait_ambience_tasks
     assert not engine.streaming_playback_manager._caller_wait_ambience_stops
 
-    await stt.results.put("Yes please.")
+    if outcome == "success":
+        await stt.results.put("Yes please.")
     await asyncio.sleep(0.08)
-    assert llm.calls == (2 if via_followup else 1)
+    assert llm.calls == (0 if direct_confirmation else 2 if via_followup else 1)
     assert len(requests) == 1
 
     caplog.clear()
@@ -460,3 +593,61 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
         await capture_task
     http_server.close()
     await http_server.wait_closed()
+
+
+@pytest.mark.parametrize(
+    "options,expected",
+    [
+        ({"call_id_header_enabled": True, "session_user_from_call_id": True}, True),
+        ({}, False),
+        ({"call_id_header_enabled": True}, False),
+        ({"session_user_from_call_id": True}, False),
+        ({"call_id_header_enabled": "true", "session_user_from_call_id": "true"}, False),
+    ],
+)
+def test_direct_confirmation_reuses_existing_call_scoped_transport_only(options, expected):
+    engine = Engine.__new__(Engine)
+    guard = engine._pipeline_message_deposit_guard()
+    call_id = "native-asterisk-1789.42"
+    configured = dict(options, tools=["pbx_message_deposit"])
+    assert engine._confirmed_pipeline_message_deposit_call(call_id, configured) is None
+    guard.decide(call_id, "I'd like to leave a message for Gary.", enabled=True)
+    guard.decide(call_id, "The sky is blue.", enabled=True)
+    assert engine._confirmed_pipeline_message_deposit_call(call_id, configured) is None
+    guard.decide(call_id, "Yes.", enabled=True)
+    selected = engine._confirmed_pipeline_message_deposit_call(call_id, configured)
+    assert bool(selected) is expected
+    if selected:
+        assert selected == {"name": "pbx_message_deposit", "parameters": {}}
+        assert engine._confirmed_pipeline_message_deposit_call("another-call", configured) is None
+        assert engine._confirmed_pipeline_message_deposit_call(call_id, dict(configured, tools=[])) is None
+        bound = engine._bind_pipeline_tool_parameters(call_id, selected["name"], selected["parameters"])
+        assert bound == {"target": "Gary", "message": "The sky is blue."}
+        assert engine._confirmed_pipeline_message_deposit_call(call_id, configured) is None
+        with pytest.raises(ValueError, match="already_consumed"):
+            engine._bind_pipeline_tool_parameters(call_id, selected["name"], {})
+
+
+def test_direct_confirmation_does_not_extend_expired_guard_or_retain_after_cleanup():
+    engine = Engine.__new__(Engine)
+    now = [100.0]
+    guard = PipelineMessageDepositGuard(clock=lambda: now[0])
+    engine._pipeline_message_deposit_guard_state = guard
+    options = {
+        "call_id_header_enabled": True,
+        "session_user_from_call_id": True,
+        "tools": ["pbx_message_deposit"],
+    }
+    call_id = "1789.42"
+    guard.decide(call_id, "I'd like to leave a message for Gary.", enabled=True)
+    guard.decide(call_id, "The sky is blue.", enabled=True)
+    guard.decide(call_id, "Yes.", enabled=True)
+    selected = engine._confirmed_pipeline_message_deposit_call(call_id, options)
+    now[0] += 5.01
+    with pytest.raises(ValueError, match="confirmation_expired"):
+        engine._bind_pipeline_tool_parameters(call_id, selected["name"], selected["parameters"])
+    assert guard.snapshot(call_id)["phase"] == "awaiting_confirmation"
+    assert engine._confirmed_pipeline_message_deposit_call(call_id, options) is None
+    guard.cleanup(call_id)
+    assert guard.snapshot(call_id) is None
+    assert engine._confirmed_pipeline_message_deposit_call(call_id, options) is None

@@ -7156,6 +7156,27 @@ class Engine:
             self._pipeline_message_deposit_guard_state = guard
         return guard
 
+    def _confirmed_pipeline_message_deposit_call(
+        self,
+        call_id: str,
+        llm_options: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Reuse the executor immediately after a call-scoped relay confirmation."""
+        # Legacy receptionists keep model selection; the main relay already
+        # has exact caller-confirmed words and needs no second inference.
+        if (
+            llm_options.get("call_id_header_enabled") is not True
+            or llm_options.get("session_user_from_call_id") is not True
+            or "pbx_message_deposit" not in (llm_options.get("tools") or [])
+        ):
+            return None
+        state = self._pipeline_message_deposit_guard().snapshot(call_id)
+        if not state or state["phase"] != "depositing":
+            return None
+        # The existing execution loop consumes the exact payload once, just
+        # before dispatch. Do not copy caller words into a second buffer.
+        return {"name": "pbx_message_deposit", "parameters": {}}
+
     def _bind_pipeline_tool_parameters(
         self,
         call_id: str,
@@ -15725,13 +15746,19 @@ class Engine:
                             await self._no_input_note_processing(call_id, False)
                         return
 
+                    confirmed_deposit = self._confirmed_pipeline_message_deposit_call(
+                        call_id, llm_options
+                    )
+                    if confirmed_deposit:
+                        tool_calls = [confirmed_deposit]
+
                     # ── Pipeline filler audio: instant ack before LLM ──
                     # Uses fire-and-forget: synthesize filler, push all chunks, send
                     # EOS sentinel, then stop_streaming_playback so the slot is free
                     # for the real LLM→TTS streaming overlap that follows.
                     _streaming_cfg = getattr(self.config, "streaming", None)
                     _filler_enabled = getattr(_streaming_cfg, "pipeline_filler_enabled", False) if _streaming_cfg else False
-                    if _filler_enabled and pipeline.tts_adapter:
+                    if _filler_enabled and pipeline.tts_adapter and not tool_calls:
                         _filler_phrases = getattr(_streaming_cfg, "pipeline_filler_phrases", None) or []
                         if _filler_phrases:
                             import random as _rnd
@@ -15823,6 +15850,7 @@ class Engine:
                         _overlap_enabled
                         and _adapter_supports_streaming
                         and _use_streaming_pb
+                        and not tool_calls
                     ):
                         logger.info(
                             "Pipeline streaming overlap active",
