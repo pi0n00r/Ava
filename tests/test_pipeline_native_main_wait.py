@@ -191,11 +191,21 @@ async def test_legacy_model_wait_does_not_opt_into_new_ambience(monkeypatch, tmp
 
 
 @pytest.mark.asyncio
-async def test_outbound_greeting_uses_existing_pipeline_and_retained_preroll(monkeypatch, tmp_path):
-    context = {"status": "ready", "purpose": "your requested appointment check.", "target_display_label": "Gary"}
+@pytest.mark.parametrize("kind,text,expected", [
+    ("outgoing", "Hi Gary, it's AIm\u00e8e.", "Hi Gary, it's AIm\u00e8e."),
+    ("notification", "Hi Gary, it's AIm\u00e8e. Your appointment is tomorrow.",
+        "Hi Gary, it's AIm\u00e8e. Your appointment is tomorrow."),
+    (None, None, "Hi, it's AIm\u00e8e."),
+    ("unknown", "Hi RAW LABEL, unused speech.", "Hi, it's AIm\u00e8e."),
+    ("notification", None, "Hi, it's AIm\u00e8e."),
+])
+async def test_outbound_greeting_uses_existing_pipeline_and_retained_preroll(monkeypatch, tmp_path, kind, text, expected):
+    context = {"status": "ready", "direction": "outbound", "purpose": "your requested appointment check.",
+        "target_display_label": "HH Gary Bajaj", "opening_kind": kind, "opening_text": text}
     async with _native_wait_pipeline(monkeypatch, tmp_path, established_context=context) as h:
         await _wait_until(lambda: bool(h.tts.texts))
-        assert h.tts.texts == ["Hi Gary, it's AIm\u00e8e. I'm calling because your requested appointment check."]
+        assert h.tts.texts == [expected]
+        assert expected.count("Hi") == 1
         assert not h.llm.started.is_set()
         assert h.llm.serial_calls == 0
         await _wait_until(lambda: not h.manager.active_streams and len(h.frames) >= 9)

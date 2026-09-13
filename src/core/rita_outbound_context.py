@@ -24,7 +24,22 @@ def unknown_rita_context(error_class):
         "ext6_auth_pass_observed": False, "ext6_auth_observation_available": False,
         "ext6_auth_observation_error": None,
         "human_acknowledgement": "unproven", "error_class": error_class,
+        "opening_kind": None, "opening_text": None,
     }
+
+
+def _opening_value(value, max_bytes, private_values):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        size = len(value.encode("utf-8"))
+    except UnicodeError:
+        return None
+    if (size > max_bytes
+            or any(unicodedata.category(char) in ("Cc", "Zl", "Zp") for char in value)
+            or any(secret and secret in value for secret in private_values)):
+        return None
+    return value
 
 
 def project_rita_context(value, *, private_values=()):
@@ -68,6 +83,11 @@ def project_rita_context(value, *, private_values=()):
     error = value["ext6_auth_observation_error"]
     if error is not None and (not isinstance(error, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", error)):
         error = "unclassified_native_observation_error"
+    opening_kind = _opening_value(value.get("opening_kind"), 64, private_values)
+    opening_text = _opening_value(value.get("opening_text"), 1024, private_values)
+    # Recognized presentation intent selects speech, never call permission or routing.
+    if opening_kind not in ("outgoing", "notification"):
+        opening_text = None
     return {
         "status": "ready", "source": "rita", "direction": "outbound",
         "purpose": purpose.strip(), "pin_verified": pin,
@@ -76,12 +96,14 @@ def project_rita_context(value, *, private_values=()):
         "human_acknowledgement": "unproven", "error_class": None,
         "target_display_label": display_name,
         "target_display_label_error": label_error,
+        "opening_kind": opening_kind, "opening_text": opening_text,
     }
 
 
 def rita_outbound_greeting(context):
-    label = context.get("target_display_label")
-    greeting = f"Hi {label}, it's AIm\u00e8e." if label else "Hi, it's AIm\u00e8e."
-    if context.get("status") == "ready":
-        greeting += " I'm calling because " + " ".join(context["purpose"].split())
-    return greeting
+    if context.get("status") == "ready" and context.get("direction") == "outbound":
+        if context.get("opening_kind") in ("outgoing", "notification"):
+            opening_text = _opening_value(context.get("opening_text"), 1024, ())
+            if opening_text is not None:
+                return opening_text
+    return "Hi, it's AIm\u00e8e."

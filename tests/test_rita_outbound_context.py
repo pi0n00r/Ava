@@ -21,15 +21,16 @@ def _response(**overrides):
     }, **overrides)
 
 
-def test_private_projection_uses_native_display_name_not_destination_or_caller_id():
+def test_private_projection_preserves_native_display_name_without_spoken_interpolation():
     value = project_rita_context(dict(_response(), call_id="private-call", request_ref="private-ref", token="private-token"))
     assert value["pin_verified"] is None
     assert value["human_acknowledgement"] == "unproven"
-    assert rita_outbound_greeting(value).startswith("Hi Gary,")
+    assert value["target_display_label"] == "Gary"
+    assert rita_outbound_greeting(value) == "Hi, it's AIm\u00e8e."
     assert not any(secret in json.dumps(value) for secret in ("private-call", "private-ref", "private-token"))
     assert "target_extension" not in value
     assert rita_outbound_greeting(project_rita_context(_response(target_display_label=None))).startswith("Hi,")
-    assert rita_outbound_greeting(project_rita_context(_response(target_display_label="Avery", target_extension="1"))).startswith("Hi Avery,")
+    assert rita_outbound_greeting(project_rita_context(_response(target_display_label="Avery", target_extension="1"))) == "Hi, it's AIm\u00e8e."
 
 
 @pytest.mark.parametrize("label", ["", "x" * 97, "\u00e9" * 49, "Gary\n", "Gary\x00", "Gary\x7f", 1])
@@ -41,7 +42,8 @@ def test_native_display_label_is_bounded_not_a_directory(label):
 def test_unknown_native_label_preserves_authoritative_purpose_and_unknown_pin():
     value = project_rita_context(_response(target_display_label=None,
         target_display_label_error="freepbx_target_label_unavailable"))
-    assert rita_outbound_greeting(value) == "Hi, it's AIm\u00e8e. I'm calling because your requested appointment check."
+    assert rita_outbound_greeting(value) == "Hi, it's AIm\u00e8e."
+    assert value["purpose"] == _response()["purpose"]
     assert value["pin_verified"] is None
     assert value["target_display_label_error"] == "freepbx_target_label_unavailable"
     value = project_rita_context(_response(target_display_label=None, target_display_label_error="private-path-and-secret"))
@@ -96,7 +98,8 @@ async def test_hydration_reuses_private_auth_without_model_visible_ids(monkeypat
         assert json.loads(probe.config.body_template) == {"call_id": "{call_id}", "request_ref": ref}
         if readback == "unavailable":
             return {"status": "failed"}
-        return {"status": "success", "data": _response() if readback == "success" else {"ok": True}}
+        return {"status": "success", "data": _response(opening_kind="outgoing",
+            opening_text="Hi Gary, it's AIm\u00e8e.") if readback == "success" else {"ok": True}}
 
     monkeypatch.setattr(InCallHTTPTool, "execute", existing_native_execute)
     session = CallSession(call_id="native-ARI-fixture-001", caller_channel_id="native-ARI-fixture-001", is_outbound=True)
@@ -130,3 +133,98 @@ async def test_hydration_leaves_inbound_and_legacy_sessions_untouched():
     await engine._hydrate_rita_outbound_session(session, {})
     engine.ari_client.send_command.assert_not_awaited()
     assert session.provider_overrides == session.rita_outbound_context == {}
+
+
+@pytest.mark.parametrize("kind,text", [
+    ("outgoing", "Hi Gary, it's AIm\u00e8e."),
+    ("notification", "Hi Gary, it's AIm\u00e8e. Your requested appointment is tomorrow."),
+])
+def test_prepared_opening_preserves_complete_text_without_hi_or_purpose_append(kind, text):
+    value = project_rita_context(_response(opening_kind=kind, opening_text=text,
+        target_display_label="HH Gary Bajaj"))
+    assert rita_outbound_greeting(value) == text
+    assert text.count("Hi") == 1
+    assert value["purpose"] == _response()["purpose"]
+    assert value["target_display_label"] == "HH Gary Bajaj"
+    assert "HH" not in rita_outbound_greeting(value)
+    assert "your requested appointment check" not in rita_outbound_greeting(value)
+
+
+@pytest.mark.parametrize("kind", [None, "", "incoming", "unrecognized", "Notification", 1, {},
+    "x" * 65, "\u00e9" * 33, "notification\n", "notification\x7f", "notification\u2028"])
+def test_missing_or_unknown_kind_ignores_prepared_speech_without_losing_native_context(kind):
+    value = project_rita_context(_response(opening_kind=kind,
+        opening_text="Hi RAW LABEL, invented purpose must not play.",
+        pin_verified=True, ext6_auth_pass_observed=True, ext6_auth_observation_available=True))
+    assert rita_outbound_greeting(value) == "Hi, it's AIm\u00e8e."
+    assert value["opening_text"] is None
+    assert value["status"] == "ready" and value["direction"] == "outbound"
+    assert value["pin_verified"] is True
+    assert value["purpose"] == _response()["purpose"]
+    assert value["human_acknowledgement"] == "unproven"
+
+
+@pytest.mark.parametrize("text", [None, "", " ", 1, {}, "x" * 1025, "\u00e9" * 513,
+    "Hi\nGary", "Hi\rGary", "Hi\x00Gary", "Hi\x7fGary", "Hi\tGary", "Hi\u0085Gary",
+    "Hi\u2028Gary", "Hi\u2029Gary", "\ud800"])
+def test_unusable_optional_opening_text_uses_generic_introduction_not_a_contact_ban(text):
+    value = project_rita_context(_response(opening_kind="notification", opening_text=text))
+    assert rita_outbound_greeting(value) == "Hi, it's AIm\u00e8e."
+    assert value["opening_text"] is None
+    assert value["status"] == "ready"
+    assert value["purpose"] == _response()["purpose"]
+    assert value["pin_verified"] is None
+
+
+def test_opening_utf8_boundary_and_no_numeric_or_identity_rewrites():
+    text = "\u00e9" * 512
+    value = project_rita_context(_response(opening_kind="outgoing", opening_text=text))
+    assert rita_outbound_greeting(value) == text
+    kind = "\u00e9" * 32
+    value = project_rita_context(_response(opening_kind=kind, opening_text=text))
+    assert value["opening_kind"] == kind
+    assert value["opening_text"] is None
+    text = "Hi Avery, it's AIm\u00e8e. Reference +1 (416) 555-0123; CAD 1,416.50."
+    value = project_rita_context(_response(opening_kind="outgoing", opening_text=text,
+        target_display_label="Native Other Name", target_extension="1"))
+    assert rita_outbound_greeting(value) == text
+    assert value["target_display_label"] == "Native Other Name"
+
+
+@pytest.mark.parametrize("secret", ["raw-native-call-123", "a" * 64])
+def test_opening_private_ids_are_not_projected_or_spoken(secret):
+    value = project_rita_context(_response(opening_kind="notification", opening_text="Hi, " + secret),
+        private_values=(secret,))
+    assert secret not in json.dumps(value)
+    assert rita_outbound_greeting(value) == "Hi, it's AIm\u00e8e."
+    value = project_rita_context(_response(opening_kind=secret, opening_text="Hi, unintended speech."),
+        private_values=(secret,))
+    assert secret not in json.dumps(value)
+    assert value["opening_kind"] is None
+
+
+def test_prepared_opening_does_not_require_native_name_and_does_not_change_direction_auth():
+    text = "Hi Gary, it's AIm\u00e8e."
+    value = project_rita_context(_response(opening_kind="outgoing", opening_text=text,
+        target_display_label=None, target_display_label_error="freepbx_target_label_unavailable"))
+    assert rita_outbound_greeting(value) == text
+    assert value["pin_verified"] is None
+    with pytest.raises(ValueError, match="rita_context_malformed"):
+        project_rita_context(_response(direction="inbound", opening_kind="notification", opening_text=text))
+    assert rita_outbound_greeting(dict(value, direction="inbound")) == "Hi, it's AIm\u00e8e."
+
+
+@pytest.mark.asyncio
+async def test_hydration_cancellation_propagates_without_greeting_or_store_write(monkeypatch):
+    import asyncio
+    engine = Engine.__new__(Engine)
+    engine.ari_client = SimpleNamespace(send_command=AsyncMock(side_effect=asyncio.CancelledError))
+    engine.session_store = SimpleNamespace(upsert_call=AsyncMock())
+    session = CallSession(call_id="native-cancel-call", caller_channel_id="native-cancel-call", is_outbound=True)
+    session.provider_overrides = {"baseline": "keep"}
+    with pytest.raises(asyncio.CancelledError):
+        await engine._hydrate_rita_outbound_session(session,
+            {"call_id_header_enabled": True, "session_user_from_call_id": True})
+    assert session.provider_overrides == {"baseline": "keep"}
+    assert session.rita_outbound_context == {}
+    engine.session_store.upsert_call.assert_not_awaited()
