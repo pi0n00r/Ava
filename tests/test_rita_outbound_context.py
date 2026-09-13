@@ -176,6 +176,27 @@ def test_unusable_optional_opening_text_uses_generic_introduction_not_a_contact_
     assert value["pin_verified"] is None
 
 
+@pytest.mark.parametrize("char", ["\u200b", "\u200e", "\u202e", "\u2060", "\ufeff"])
+@pytest.mark.parametrize("field", ["opening_kind", "opening_text"])
+def test_opening_format_controls_use_generic_without_changing_native_context(char, field):
+    fields = {"opening_kind": "notification", "opening_text": "Hi Avery, it's AIm\u00e8e."}
+    fields[field] += char
+    purpose = "native" + char + " purpose"
+    response = _response(**fields, purpose=purpose, pin_verified=True,
+        ext6_auth_pass_observed=True, ext6_auth_observation_available=True)
+    value = project_rita_context(response)
+    assert value[field] is None
+    assert value["opening_text"] is None
+    assert rita_outbound_greeting(value) == "Hi, it's AIm\u00e8e."
+    assert rita_outbound_greeting(dict(response, status="ready")) == "Hi, it's AIm\u00e8e."
+    assert value["status"] == "ready" and value["direction"] == "outbound"
+    assert value["purpose"] == purpose
+    assert value["pin_verified"] is True
+    assert value["ext6_auth_pass_observed"] is True
+    assert value["ext6_auth_observation_available"] is True
+    assert value["human_acknowledgement"] == "unproven"
+
+
 def test_opening_utf8_boundary_and_no_numeric_or_identity_rewrites():
     text = "\u00e9" * 512
     value = project_rita_context(_response(opening_kind="outgoing", opening_text=text))
