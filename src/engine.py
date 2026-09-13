@@ -15655,11 +15655,21 @@ class Engine:
 
                 async def cancel_flush() -> None:
                     nonlocal flush_task
-                    if flush_task and not flush_task.done():
-                        current = asyncio.current_task()
-                        if flush_task is not current:
-                            flush_task.cancel()
+                    task = flush_task
                     flush_task = None
+                    if task and task is not asyncio.current_task():
+                        if not task.done():
+                            task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                        except Exception as exc:
+                            logger.debug(
+                                "Pipeline aggregation task failed while settling",
+                                call_id=call_id,
+                                error_type=type(exc).__name__,
+                            )
 
                 async def run_turn(transcript_text: str) -> None:
                     nonlocal conversation_history
@@ -15827,6 +15837,9 @@ class Engine:
                         first_tts_ts: Optional[float] = None
 
                         stream_q: asyncio.Queue = asyncio.Queue(maxsize=256)
+                        stream_id: Optional[str] = None
+                        llm_stream = None
+                        tts_stream = None
                         old_provider_name = getattr(session, "provider_name", None)
                         try:
                             self._assign_session_provider(session, "pipeline")
@@ -15846,19 +15859,37 @@ class Engine:
                             except Exception:
                                 tts_rate = 8000
 
-                            stream_id = await self.streaming_playback_manager.start_streaming_playback(
-                                call_id,
-                                stream_q,
-                                playback_type="pipeline-tts",
-                                source_encoding=tts_encoding,
-                                source_sample_rate=tts_rate,
-                            )
-                            if not stream_id:
-                                raise RuntimeError("start_streaming_playback returned no stream_id")
+                            async def queue_tts_chunk(chunk: bytes) -> None:
+                                nonlocal stream_id
+                                if not self._pipeline_output_allowed(
+                                    call_id, session, stage="stream-audio"
+                                ):
+                                    raise _PipelinePlaybackInterrupted(call_id)
+                                if stream_id is None:
+                                    # Gate capture only once the existing playback queue has real audio.
+                                    stream_q.put_nowait(chunk)
+                                    stream_id = await self.streaming_playback_manager.start_streaming_playback(
+                                        call_id,
+                                        stream_q,
+                                        playback_type="pipeline-tts",
+                                        source_encoding=tts_encoding,
+                                        source_sample_rate=tts_rate,
+                                    )
+                                    if not stream_id:
+                                        raise RuntimeError("start_streaming_playback returned no stream_id")
+                                else:
+                                    await self._put_pipeline_stream_chunk(
+                                        call_id, stream_id, stream_q, chunk
+                                    )
 
-                            async for token in pipeline.llm_adapter.generate_stream(
+                            llm_stream = pipeline.llm_adapter.generate_stream(
                                 call_id, transcript_text, context_for_llm, llm_options,
-                            ):
+                            )
+                            async for token in llm_stream:
+                                if not self._pipeline_output_allowed(
+                                    call_id, session, stage="stream-token"
+                                ):
+                                    raise _PipelinePlaybackInterrupted(call_id)
                                 sentence_buffer += token
                                 full_response_text += token
 
@@ -15869,9 +15900,10 @@ class Engine:
                                     sentence_buffer = sentence_buffer[split_pos:]
 
                                     if to_speak:
-                                        async for tts_chunk in pipeline.tts_adapter.synthesize(
+                                        tts_stream = pipeline.tts_adapter.synthesize(
                                             call_id, to_speak, pipeline.tts_options,
-                                        ):
+                                        )
+                                        async for tts_chunk in tts_stream:
                                             if tts_chunk:
                                                 if first_tts_ts is None:
                                                     first_tts_ts = time.time()
@@ -15884,29 +15916,31 @@ class Engine:
                                                             )
                                                     except Exception:
                                                         pass
-                                                await self._put_pipeline_stream_chunk(
-                                                    call_id, stream_id, stream_q, tts_chunk
-                                                )
+                                                await queue_tts_chunk(tts_chunk)
 
                             # Flush remaining sentence buffer
+                            if not self._pipeline_output_allowed(
+                                call_id, session, stage="stream-remainder"
+                            ):
+                                raise _PipelinePlaybackInterrupted(call_id)
                             remainder = sentence_buffer.strip()
                             if remainder:
-                                async for tts_chunk in pipeline.tts_adapter.synthesize(
+                                tts_stream = pipeline.tts_adapter.synthesize(
                                     call_id, remainder, pipeline.tts_options,
-                                ):
+                                )
+                                async for tts_chunk in tts_stream:
                                     if tts_chunk:
                                         if first_tts_ts is None:
                                             first_tts_ts = time.time()
                                             turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
                                             session.turn_latencies_ms.append(turn_latency_ms)
-                                        await self._put_pipeline_stream_chunk(
-                                            call_id, stream_id, stream_q, tts_chunk
-                                        )
+                                        await queue_tts_chunk(tts_chunk)
 
                             # End-of-segment sentinel
-                            await self._put_pipeline_stream_chunk(
-                                call_id, stream_id, stream_q, None
-                            )
+                            if stream_id is not None:
+                                await self._put_pipeline_stream_chunk(
+                                    call_id, stream_id, stream_q, None
+                                )
                             try:
                                 if t_start is not None:
                                     _TURN_RESPONSE_SECONDS.labels(pipeline_label, provider_label).observe(
@@ -15922,28 +15956,57 @@ class Engine:
                                 stream_id=stream_id,
                             )
                             try:
-                                await self.streaming_playback_manager.stop_streaming_playback(call_id)
+                                if stream_id is not None and self.streaming_playback_manager.is_stream_active(call_id, stream_id):
+                                    await self.streaming_playback_manager.stop_streaming_playback(call_id)
                             except Exception:
                                 pass
                             return
+                        except asyncio.CancelledError:
+                            try:
+                                if stream_id is not None and self.streaming_playback_manager.is_stream_active(call_id, stream_id):
+                                    await self.streaming_playback_manager.stop_streaming_playback(call_id)
+                            except Exception:
+                                pass
+                            raise
                         except Exception:
                             logger.error(
-                                "Pipeline streaming overlap failed; falling through to serial path",
+                                "Pipeline streaming overlap failed",
                                 call_id=call_id,
+                                serial_fallback=stream_id is None,
                                 exc_info=True,
                             )
                             try:
-                                await self.streaming_playback_manager.stop_streaming_playback(call_id)
+                                if stream_id is not None and self.streaming_playback_manager.is_stream_active(call_id, stream_id):
+                                    await self.streaming_playback_manager.stop_streaming_playback(call_id)
                             except Exception:
                                 pass
-                            # Don't return — fall through to serial path below
+                            # Do not generate a second answer after caller-facing audio has begun.
+                            if stream_id is not None:
+                                return
                             full_response_text = ""
                         finally:
+                            # Close the suspended LLM generator when TTS/backpressure is interrupted.
+                            close_cancelled = None
+                            for component, pending_stream in (("tts", tts_stream), ("llm", llm_stream)):
+                                if pending_stream is not None:
+                                    try:
+                                        await pending_stream.aclose()
+                                    except asyncio.CancelledError as exc:
+                                        close_cancelled = exc
+                                    except Exception as exc:
+                                        logger.debug(
+                                            "Pipeline generator cleanup failed",
+                                            call_id=call_id,
+                                            component=component,
+                                            error_type=type(exc).__name__,
+                                        )
                             try:
                                 self._assign_session_provider(session, old_provider_name)
                                 await self.session_store.upsert_call(session)
                             except Exception:
                                 pass
+                            if close_cancelled is not None:
+                                raise close_cancelled
 
                         if full_response_text.strip():
                             response_text = full_response_text.strip()
@@ -17031,19 +17094,15 @@ class Engine:
                                 await self._no_input_set_suspended(call_id, False)
 
                 async def maybe_respond(force: bool, from_flush: bool = False) -> None:
-                    nonlocal pending_segments, flush_task
+                    nonlocal pending_segments
                     if not pending_segments:
-                        if from_flush:
-                            flush_task = None
-                        else:
+                        if not from_flush:
                             await cancel_flush()
                         return
                     aggregated = " ".join(pending_segments).strip()
                     if not aggregated:
                         pending_segments.clear()
-                        if from_flush:
-                            flush_task = None
-                        else:
+                        if not from_flush:
                             await cancel_flush()
                         return
                     words = len([w for w in aggregated.split() if w])
@@ -17069,9 +17128,7 @@ class Engine:
                                 words=words,
                             )
                             return
-                    if from_flush:
-                        flush_task = None
-                    else:
+                    if not from_flush:
                         await cancel_flush()
                     await run_turn(aggregated)
                     pending_segments.clear()
@@ -17081,11 +17138,15 @@ class Engine:
                     await cancel_flush()
 
                     async def _flush() -> None:
+                        nonlocal flush_task
                         try:
                             await asyncio.sleep(accumulation_timeout)
                             await maybe_respond(force=True, from_flush=True)
                         except asyncio.CancelledError:
                             pass
+                        finally:
+                            if flush_task is asyncio.current_task():
+                                flush_task = None
 
                     flush_task = asyncio.create_task(_flush())
 
