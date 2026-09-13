@@ -7990,6 +7990,8 @@ class Engine:
         user_text: str,
         assistant_text: str,
         hangup_policy: Dict[str, Any],
+        *,
+        explicit_caller_end_only: bool = False,
     ) -> bool:
         """Require explicit caller end intent plus a spoken assistant farewell."""
         markers = hangup_policy.get("markers") if isinstance(hangup_policy, dict) else {}
@@ -8001,7 +8003,7 @@ class Engine:
         explicit_markers = [marker for marker in configured if marker not in ambiguous]
         has_user_end = (
             text_contains_end_call_intent(user_text, explicit_markers)
-            or text_is_short_polite_closing(user_text)
+            or (not explicit_caller_end_only and text_is_short_polite_closing(user_text))
         )
         farewell_markers = normalize_marker_list(
             markers.get("assistant_farewell"),
@@ -16167,6 +16169,7 @@ class Engine:
                                     transcript_text,
                                     response_text,
                                     resolve_hangup_policy(tools_cfg),
+                                    explicit_caller_end_only=session.context_name == "aimee_main",
                                 ):
                                     logger.warning(
                                         "Pipeline omitted hangup_call after farewell; applying terminal fallback",
@@ -16554,6 +16557,7 @@ class Engine:
                             transcript_text,
                             response_text,
                             resolve_hangup_policy(tools_cfg),
+                            explicit_caller_end_only=session.context_name == "aimee_main",
                         ):
                             logger.warning(
                                 "Pipeline omitted hangup_call after farewell; applying terminal fallback",

@@ -41,6 +41,20 @@ class _ColdNativeLLM(LLMComponent):
             self.closed.set()
 
 
+class _FarewellLLM(LLMComponent):
+    def __init__(self, streaming):
+        self.supports_streaming = streaming
+        self.calls = 0
+
+    async def generate(self, *args, **kwargs):
+        self.calls += 1
+        return "You're welcome, have a great day!"
+
+    async def generate_stream(self, *args, **kwargs):
+        self.calls += 1
+        yield "You're welcome, have a great day!"
+
+
 @asynccontextmanager
 async def _native_wait_pipeline(monkeypatch, tmp_path, *, scoped=True, established_context=None,
                                 llm=None, tts=None, downstream_mode="stream"):
@@ -191,6 +205,46 @@ async def test_legacy_model_wait_does_not_opt_into_new_ambience(monkeypatch, tmp
         assert h.frames == []
         assert not h.manager._caller_wait_ambience_tasks
         assert h.session.audio_capture_enabled is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("main", [False, True])
+async def test_gratitude_is_a_main_second_turn_without_changing_ext7(monkeypatch, tmp_path, streaming, main):
+    llm = _FarewellLLM(streaming)
+    async with _native_wait_pipeline(monkeypatch, tmp_path, scoped=main, llm=llm) as h:
+        terminate = AsyncMock()
+        monkeypatch.setattr(h.engine, "_terminate_call_after_audio", terminate)
+        await h.stt.results.put("Thank you")
+        await _wait_until(lambda: len(h.tts.texts) == 1)
+        # Empty active_streams before lazy start is not a completed first reply.
+        await _wait_until(lambda: h.session.vad_state.get("pipeline_observability", {}).get("capture_reopen_count", 0) >= 1)
+        await _wait_until(lambda: not h.manager.active_streams)
+        if not main:
+            await _wait_until(lambda: terminate.await_count == 1)
+            return
+        assert terminate.await_count == 0
+        await h.stt.results.put("Please tell me more")
+        await _wait_until(lambda: len(h.tts.texts) == 2)
+        await _wait_until(lambda: h.session.vad_state.get("pipeline_observability", {}).get("capture_reopen_count", 0) >= 2)
+        await _wait_until(lambda: not h.manager.active_streams)
+        assert llm.calls == 2
+        assert terminate.await_count == 0
+        assert h.session.audio_capture_enabled
+        assert h.session.context_name == "aimee_main"
+        assert [entry["content"] for entry in h.session.conversation_history if entry["role"] == "user"] == ["Thank you", "Please tell me more"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("caller", ["That's all, thank you", "Goodbye", "Hang up the call"])
+async def test_main_explicit_end_keeps_existing_terminal_path(monkeypatch, tmp_path, streaming, caller):
+    async with _native_wait_pipeline(monkeypatch, tmp_path, llm=_FarewellLLM(streaming)) as h:
+        terminate = AsyncMock()
+        monkeypatch.setattr(h.engine, "_terminate_call_after_audio", terminate)
+        await h.stt.results.put(caller)
+        await _wait_until(lambda: terminate.await_count == 1)
+        assert terminate.call_args.kwargs["reason"] == "pipeline_farewell_without_tool"
 
 
 @pytest.mark.asyncio

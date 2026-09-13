@@ -666,6 +666,26 @@ def test_pipeline_terminal_fallback_requires_assistant_farewell():
     )
 
 
+@pytest.mark.parametrize("caller,terminal", [
+    ("Thank you", False), ("Thanks", False), ("Okay, thank you", False),
+    ("Thank you very much", False), ("Thank you, please tell me more", False),
+    ("No thanks", False), ("That's all, thank you", True),
+    ("Goodbye", True), ("Hang up the call", True),
+])
+def test_main_fallback_requires_explicit_caller_end(caller, terminal):
+    assert Engine._is_pipeline_farewell_without_tool(
+        caller, "Thank you for calling. Goodbye.", normalize_hangup_policy({}),
+        explicit_caller_end_only=True,
+    ) is terminal
+
+
+@pytest.mark.parametrize("caller", ["Thank you", "Thanks", "Okay, thank you"])
+def test_ext7_default_terminal_fallback_keeps_retained_behavior(caller):
+    assert Engine._is_pipeline_farewell_without_tool(
+        caller, "Thank you for calling. Goodbye.", normalize_hangup_policy({}),
+    )
+
+
 class _StubResolution:
     def __init__(self, stt_adapter=None, stt_options=None, llm_adapter=None, tts_adapter=None):
         self.pipeline_name = "stub"
