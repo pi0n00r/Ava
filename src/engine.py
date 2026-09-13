@@ -3157,7 +3157,6 @@ class Engine:
             attempt_id=attempt_id,
             amd_status=amd_status,
             amd_cause=amd_cause,
-            consent_dtmf=consent_dtmf or None,
             consent_result=consent_result or None,
         )
 
@@ -8953,7 +8952,6 @@ class Engine:
             logger.info(
                 "Channel DTMF received",
                 channel_id=channel_id,
-                digit=digit,
             )
 
             if not channel_id or not digit:
@@ -8973,8 +8971,8 @@ class Engine:
                     if session and session.current_action and session.current_action.get("type") == "attended_transfer":
                         session.current_action["decision_digit"] = str(digit)
                         await self._save_session(session)
-                except Exception:
-                    logger.debug("Failed to persist attended transfer DTMF digit", call_id=call_id, exc_info=True)
+                except Exception as exc:
+                    logger.debug("Failed to persist attended transfer DTMF digit", call_id=call_id, error_type=type(exc).__name__)
 
             waiter = self._attended_transfer_dtmf_waiters.get(channel_id)
             if waiter and not waiter.done():
@@ -8983,7 +8981,7 @@ class Engine:
                 except Exception:
                     pass
         except Exception as exc:
-            logger.error("Error handling ChannelDtmfReceived", error=str(exc), exc_info=True)
+            logger.error("Error handling ChannelDtmfReceived", error_type=type(exc).__name__)
 
     async def _handle_channel_varset(self, event: dict):
         """Monitor ChannelVarset events for debugging configuration state."""
@@ -12301,9 +12299,9 @@ class Engine:
         """Handle DTMF received over AudioSocket (informational)."""
         try:
             caller_channel_id = self.conn_to_channel.get(conn_id)
-            logger.info("AudioSocket DTMF received", conn_id=conn_id, caller_channel_id=caller_channel_id, digit=digit)
+            logger.info("AudioSocket DTMF received", conn_id=conn_id, caller_channel_id=caller_channel_id)
         except Exception as exc:
-            logger.error("Error handling AudioSocket DTMF", conn_id=conn_id, error=str(exc), exc_info=True)
+            logger.error("Error handling AudioSocket DTMF", conn_id=conn_id, error_type=type(exc).__name__)
 
     def _externalmedia_continuous_input_mode(
         self,
