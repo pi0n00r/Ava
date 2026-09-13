@@ -78,6 +78,9 @@ from .core.transport_orchestrator import TransportOrchestrator, TransportProfile
 from .core.models import CallSession
 from .core.no_input_watchdog import NoInputPolicy, NoInputWatchdog
 from .core.pipeline_message_deposit import PipelineMessageDepositGuard
+from .core.rita_outbound_context import (
+    project_rita_context, rita_context_url, rita_outbound_greeting, unknown_rita_context,
+)
 from .core.outbound_schedule import normalize_outbound_daily_window
 from .core.outbound_store import get_outbound_store, outbound_flag_enabled
 from .utils.audio_capture import AudioCaptureManager
@@ -7155,6 +7158,87 @@ class Engine:
             guard = PipelineMessageDepositGuard()
             self._pipeline_message_deposit_guard_state = guard
         return guard
+
+    async def _hydrate_rita_outbound_session(self, session: CallSession, llm_options: Dict[str, Any]) -> None:
+        if (
+            not session.is_outbound or session.rita_outbound_context
+            or llm_options.get("call_id_header_enabled") is not True
+            or llm_options.get("session_user_from_call_id") is not True
+        ):
+            return
+        from src.tools.context import ToolExecutionContext
+        from src.tools.http.in_call_lookup import InCallHTTPConfig, InCallHTTPTool
+
+        projection = unknown_rita_context("rita_context_unconfigured")
+        try:
+            response = await self.ari_client.send_command(
+                "GET", f"channels/{session.caller_channel_id or session.call_id}/variable",
+                params={"variable": "RITA_REQUEST_REF"}, tolerate_statuses=[404],
+            )
+            request_ref = response.get("value") if isinstance(response, dict) else None
+            if request_ref is not None and not isinstance(request_ref, str):
+                raise ValueError("rita_context_malformed_reference")
+            request_ref = (request_ref or "").strip()
+            if request_ref and not re.fullmatch(r"[0-9a-f]{64}", request_ref):
+                raise ValueError("rita_context_malformed_reference")
+            registry = self._tool_registry_for_session(session)
+            tool = next((registry.get(name) for name in ("pbx_message_deposit", "pbx_semantic_handoff")
+                         if registry.get(name) is not None), None)
+            config = getattr(tool, "config", None)
+            if config is not None and any(
+                str(key).lower() == "authorization" and value
+                for key, value in config.headers.items()
+            ):
+                url = rita_context_url(_resolve_env_vars(config.url))
+                body = {"call_id": "{call_id}"}
+                if request_ref:
+                    body["request_ref"] = request_ref
+                # This adapter is private initialization, never registered as a tool.
+                probe = InCallHTTPTool(InCallHTTPConfig(
+                    name="rita_outbound_context", url=url, method="POST",
+                    headers=dict(config.headers), timeout_ms=5000,
+                    body_template=json.dumps(body), return_raw_json=True,
+                ))
+                result = await probe.execute({}, ToolExecutionContext(
+                    call_id=session.call_id, caller_channel_id=session.caller_channel_id,
+                    session_store=self.session_store, ari_client=self.ari_client,
+                    config=self._tool_config_for_session(session), provider_name="pipeline",
+                ))
+                if result.get("status") == "success":
+                    projection = project_rita_context(
+                        result.get("data"), private_values=(session.call_id, request_ref),
+                    )
+                else:
+                    projection = unknown_rita_context("rita_context_unavailable")
+        except asyncio.CancelledError:
+            raise
+        except ValueError as exc:
+            known = {
+                "rita_context_malformed", "rita_context_malformed_reference",
+                "rita_context_unconfigured", "rita_context_private_value",
+            }
+            projection = unknown_rita_context(str(exc) if str(exc) in known else "rita_context_malformed")
+        except Exception:
+            projection = unknown_rita_context("rita_context_readback_failed")
+        session.rita_outbound_context = projection
+        session.provider_overrides = dict(session.provider_overrides, greeting=rita_outbound_greeting(projection))
+        if projection["status"] == "ready":
+            session.outbound_custom_vars = dict(session.outbound_custom_vars, purpose=projection["purpose"])
+        await self.session_store.upsert_call(session)
+
+    async def _start_pipeline_model_wait(self, call_id: str, llm_options: Dict[str, Any]) -> Optional[asyncio.Task]:
+        if (llm_options.get("call_id_header_enabled") is not True
+                or llm_options.get("session_user_from_call_id") is not True):
+            return None
+        manager = self.streaming_playback_manager
+        if not await manager.start_caller_wait_ambience(call_id):
+            return None
+        return manager._caller_wait_ambience_tasks.get(call_id)
+
+    async def _stop_pipeline_model_wait(self, call_id: str, owned_task: Optional[asyncio.Task]) -> None:
+        manager = self.streaming_playback_manager
+        if owned_task is not None and manager._caller_wait_ambience_tasks.get(call_id) is owned_task:
+            await manager.stop_caller_wait_ambience(call_id)
 
     def _confirmed_pipeline_message_deposit_call(
         self,
@@ -15113,6 +15197,8 @@ class Engine:
             except Exception:
                 logger.debug("Pipeline tool injection failed", call_id=call_id, exc_info=True)
 
+            await self._hydrate_rita_outbound_session(session, llm_options)
+
             # Outbound lead context injection (structured JSON, not template substitution).
             try:
                 if getattr(session, "is_outbound", False) and getattr(session, "outbound_custom_vars", None):
@@ -15224,10 +15310,14 @@ class Engine:
             greeting = ""
             greeting_source = "none"
             try:
+                if session.is_outbound and session.rita_outbound_context:
+                    greeting = str(session.provider_overrides.get("greeting") or "").strip()
+                    if greeting:
+                        greeting_source = "rita_outbound_context"
                 # Priority 1: Check if context has a custom greeting
                 # Use session.context_name (persisted string) instead of transport_profile.context
                 context_name = getattr(session, 'context_name', None)
-                if context_name:
+                if context_name and not greeting:
                     context_config = self.transport_orchestrator.get_context_config(
                         context_name, getattr(session, 'routing_method', None))
                     if context_config and context_config.greeting:
@@ -15692,8 +15782,15 @@ class Engine:
                                 error_type=type(exc).__name__,
                             )
 
-                async def run_turn(transcript_text: str) -> None:
+                async def _run_turn(transcript_text: str, model_wait: Dict[str, Any]) -> None:
                     nonlocal conversation_history
+                    async def start_model_wait() -> None:
+                        if model_wait.get("task") is None:
+                            model_wait["task"] = await self._start_pipeline_model_wait(call_id, llm_options)
+
+                    async def stop_model_wait() -> None:
+                        await self._stop_pipeline_model_wait(call_id, model_wait.pop("task", None))
+
                     if not self._pipeline_output_allowed(
                         call_id, session, stage="turn-start"
                     ):
@@ -15895,6 +15992,7 @@ class Engine:
                                     raise _PipelinePlaybackInterrupted(call_id)
                                 if stream_id is None:
                                     # Gate capture only once the existing playback queue has real audio.
+                                    await stop_model_wait()
                                     stream_q.put_nowait(chunk)
                                     stream_id = await self.streaming_playback_manager.start_streaming_playback(
                                         call_id,
@@ -15910,6 +16008,7 @@ class Engine:
                                         call_id, stream_id, stream_q, chunk
                                     )
 
+                            await start_model_wait()
                             llm_stream = pipeline.llm_adapter.generate_stream(
                                 call_id, transcript_text, context_for_llm, llm_options,
                             )
@@ -16100,6 +16199,7 @@ class Engine:
                     # Skip if streaming path already set tool_calls
                     if not tool_calls:
                         try:
+                            await start_model_wait()
                             llm_result = await pipeline.llm_adapter.generate(
                                 call_id,
                                 transcript_text,
@@ -16463,6 +16563,7 @@ class Engine:
 
                     # 2. Execute Tools (if any)
                     if tool_calls:
+                        await stop_model_wait()
                         # Wait for playback to finish before executing tools (especially transfer/hangup)
                         if playback_id:
                             try:
@@ -17120,6 +17221,13 @@ class Engine:
                                         )
                             finally:
                                 await self._no_input_set_suspended(call_id, False)
+
+                async def run_turn(transcript_text: str) -> None:
+                    model_wait: Dict[str, Any] = {}
+                    try:
+                        await _run_turn(transcript_text, model_wait)
+                    finally:
+                        await self._stop_pipeline_model_wait(call_id, model_wait.pop("task", None))
 
                 async def maybe_respond(force: bool, from_flush: bool = False) -> None:
                     nonlocal pending_segments

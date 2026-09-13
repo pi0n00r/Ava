@@ -204,6 +204,7 @@ class CallSession:
     outbound_lead_id: Optional[str] = None
     outbound_attempt_id: Optional[str] = None
     outbound_custom_vars: Dict[str, Any] = field(default_factory=dict)
+    rita_outbound_context: Dict[str, Any] = field(default_factory=dict)
 
     # External dialer ownership (VICIdial Remote Agent integration).
     # These are call-local snapshots so an operator edit cannot change the
