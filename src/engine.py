@@ -135,6 +135,33 @@ def _apply_provider_context_voice(
         voice_unsupported=isinstance(provider, (ElevenLabsAgentProvider, LocalProvider)),
     )
 
+
+def _context_in_call_tool_names(context_config: Any) -> List[str]:
+    """Return the additive, de-duplicated in-call tool projection for one context.
+
+    ``ContextConfig.tools`` contains ordinary tools. Ava Admin stores enabled
+    HTTP adapter names separately in ``ContextConfig.in_call_http_tools``. Both
+    must reach the same immutable per-call registry before schema generation.
+    """
+    names: List[str] = []
+
+    def append_name(value: Any) -> None:
+        if isinstance(value, str):
+            name = value.strip()
+            if name and name not in names:
+                names.append(name)
+
+    for value in list(getattr(context_config, "tools", None) or []):
+        append_name(value)
+    http_tools = getattr(context_config, "in_call_http_tools", None)
+    if isinstance(http_tools, dict):
+        for value in http_tools:
+            append_name(value)
+    elif isinstance(http_tools, (list, tuple)):
+        for value in http_tools:
+            append_name(value)
+    return names
+
 logger = get_logger(__name__)
 
 
@@ -15163,7 +15190,7 @@ class Engine:
                         context_name, getattr(session, "routing_method", None))
                     if context_config:
                         from src.tools.base import ToolPhase
-                        context_tools = list(getattr(context_config, "tools") or [])
+                        context_tools = _context_in_call_tool_names(context_config)
                         disabled_global = list(getattr(context_config, "disable_global_in_call_tools") or [])
                         tools = tool_registry.get_tools_for_context(
                             ToolPhase.IN_CALL,
