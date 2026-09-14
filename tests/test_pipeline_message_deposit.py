@@ -331,3 +331,196 @@ def test_targetless_state_is_call_scoped_and_cleanup_revokes_it():
     assert guard.snapshot("call-b") is None
     guard.cleanup("call-a")
     assert guard.snapshot("call-a") is None
+
+
+def test_explicit_that_message_reference_uses_only_fresh_same_call_prior_words():
+    now = [100.0]
+    guard = PipelineMessageDepositGuard(clock=lambda: now[0])
+    assert guard.decide(
+        "call-reference", "The blue notebook is on the desk.", enabled=True,
+    ).kind == "pass"
+
+    readback = guard.decide(
+        "call-reference", "Leave that message for Gary.", enabled=True,
+    )
+    assert readback.text == "I have: “The blue notebook is on the desk.” Is that right?"
+    with __import__("pytest").raises(ValueError, match="not_confirmed"):
+        guard.consume_confirmed_tool_parameters("call-reference", {})
+
+    guard.decide("call-reference", "Yes.", enabled=True)
+    assert guard.consume_confirmed_tool_parameters("call-reference", {}) == {
+        "target": "Gary",
+        "message": "The blue notebook is on the desk.",
+    }
+
+
+def test_that_message_without_safe_prior_asks_for_content_and_never_uses_courtesy():
+    guard = PipelineMessageDepositGuard()
+    missing = guard.decide(
+        "call-missing", "Leave that message for Gary.", enabled=True,
+    )
+    assert missing.text == "What would you like me to tell Gary?"
+    assert guard.snapshot("call-missing") == {
+        "phase": "awaiting_message", "has_target": True, "has_message": False,
+    }
+
+    assert guard.decide("call-courtesy", "Okay thanks.", enabled=True).kind == "pass"
+    courtesy = guard.decide(
+        "call-courtesy", "Leave that message for Gary.", enabled=True,
+    )
+    assert courtesy.text == "What would you like me to tell Gary?"
+    assert guard.snapshot("call-courtesy")["has_message"] is False
+
+
+def test_generic_request_never_reuses_prior_words_and_explicit_dictation_still_works():
+    guard = PipelineMessageDepositGuard()
+    guard.decide("call-generic", "The blue notebook is on the desk.", enabled=True)
+    ask = guard.decide("call-generic", "Leave a message for Gary.", enabled=True)
+    assert ask.text == "Of course. What would you like me to tell Gary?"
+    assert guard.snapshot("call-generic")["has_message"] is False
+
+    readback = guard.decide(
+        "call-generic", "Tell Gary: Okay thanks", enabled=True,
+    )
+    assert readback.text == "I have: “Okay thanks” Is that right?"
+
+
+def test_prior_reference_is_call_scoped_expires_and_cleanup_revokes_it():
+    now = [100.0]
+    guard = PipelineMessageDepositGuard(
+        clock=lambda: now[0], prior_utterance_window_sec=180.0,
+    )
+    guard.decide("call-a", "The blue notebook is on the desk.", enabled=True)
+    cross_call = guard.decide("call-b", "Leave that message for Gary.", enabled=True)
+    assert cross_call.text == "What would you like me to tell Gary?"
+    assert guard.snapshot("call-b")["has_message"] is False
+
+    now[0] = 280.01
+    stale = guard.decide("call-a", "Leave that message for Gary.", enabled=True)
+    assert stale.text == "What would you like me to tell Gary?"
+    assert guard.snapshot("call-a")["has_message"] is False
+
+    guard.decide("call-cleanup", "Call me tomorrow.", enabled=True)
+    guard.cleanup("call-cleanup")
+    cleaned = guard.decide(
+        "call-cleanup", "Leave that message for Gary.", enabled=True,
+    )
+    assert cleaned.text == "What would you like me to tell Gary?"
+
+
+def test_referenced_message_correction_and_cancel_preserve_existing_guards():
+    guard = PipelineMessageDepositGuard()
+    guard.decide("call-edit", "The blue notebook is on the desk.", enabled=True)
+    guard.decide("call-edit", "Leave that message for Gary.", enabled=True)
+
+    corrected = guard.decide(
+        "call-edit", "No, change it to the green notebook is on the desk.", enabled=True,
+    )
+    assert corrected.text == "I have: “the green notebook is on the desk.” Is that right?"
+    with __import__("pytest").raises(ValueError, match="not_confirmed"):
+        guard.consume_confirmed_tool_parameters("call-edit", {})
+    cancelled = guard.decide("call-edit", "Never mind.", enabled=True)
+    assert cancelled.text == "Of course."
+    assert guard.snapshot("call-edit") is None
+
+
+def test_disabled_guard_keeps_ext7_ordinary_and_forgets_prior_candidate():
+    guard = PipelineMessageDepositGuard()
+    assert guard.decide(
+        "ext7-call", "The blue notebook is on the desk.", enabled=False,
+    ).kind == "pass"
+    assert guard.decide(
+        "ext7-call", "Leave that message for Gary.", enabled=False,
+    ).kind == "pass"
+    assert guard.snapshot("ext7-call") is None
+
+    enabled_later = guard.decide(
+        "ext7-call", "Leave that message for Gary.", enabled=True,
+    )
+    assert enabled_later.text == "What would you like me to tell Gary?"
+
+
+def test_referenced_request_after_acknowledgement_requires_fresh_content():
+    guard = PipelineMessageDepositGuard()
+    guard.decide("call-ack", "Leave a message for Gary.", enabled=True)
+    guard.decide("call-ack", "The sky is blue.", enabled=True)
+    guard.decide("call-ack", "Yes.", enabled=True)
+    guard.consume_confirmed_tool_parameters("call-ack", {})
+    guard.note_tool_result("call-ack", success=True)
+
+    ask = guard.decide(
+        "call-ack", "Leave that message for Priya.", enabled=True,
+    )
+    assert ask.text == "What would you like me to tell Priya?"
+    assert guard.snapshot("call-ack") == {
+        "phase": "awaiting_message", "has_target": True, "has_message": False,
+    }
+
+
+def test_referenced_request_while_awaiting_message_changes_only_recipient():
+    guard = PipelineMessageDepositGuard()
+    guard.decide("call-wait-message", "Leave a message for Gary.", enabled=True)
+
+    ask = guard.decide(
+        "call-wait-message", "Leave that message for Priya.", enabled=True,
+    )
+    assert ask.text == "What would you like me to tell Priya?"
+    assert guard.snapshot("call-wait-message") == {
+        "phase": "awaiting_message", "has_target": True, "has_message": False,
+    }
+    readback = guard.decide(
+        "call-wait-message", "The meeting starts at four.", enabled=True,
+    )
+    assert readback.text == "I have: “The meeting starts at four.” Is that right?"
+
+
+def test_referenced_request_while_awaiting_target_sets_target_but_not_payload():
+    guard = PipelineMessageDepositGuard()
+    guard.decide("call-wait-target", "Leave a message.", enabled=True)
+
+    ask = guard.decide(
+        "call-wait-target", "Leave that message for Priya.", enabled=True,
+    )
+    assert ask.text == "What would you like me to tell Priya?"
+    assert guard.snapshot("call-wait-target") == {
+        "phase": "awaiting_message", "has_target": True, "has_message": False,
+    }
+
+
+def test_referenced_request_while_awaiting_confirmation_is_not_consent():
+    guard = PipelineMessageDepositGuard()
+    guard.decide("call-wait-confirm", "Leave a message for Gary.", enabled=True)
+    guard.decide("call-wait-confirm", "The sky is blue.", enabled=True)
+
+    ask = guard.decide(
+        "call-wait-confirm", "Leave that message for Priya.",
+        enabled=True,
+        caller_controls=True,
+    )
+    assert ask.text == "What would you like me to tell Priya?"
+    assert guard.snapshot("call-wait-confirm") == {
+        "phase": "awaiting_message", "has_target": True, "has_message": False,
+    }
+    with __import__("pytest").raises(ValueError, match="not_confirmed"):
+        guard.consume_confirmed_tool_parameters("call-wait-confirm", {})
+
+
+def test_referenced_request_does_not_change_executing_or_reconciling_attempt():
+    guard = PipelineMessageDepositGuard()
+    guard.decide("call-uncertain", "Leave a message for Gary.", enabled=True)
+    guard.decide("call-uncertain", "The sky is blue.", enabled=True)
+    guard.decide("call-uncertain", "Yes.", enabled=True)
+    guard.consume_confirmed_tool_parameters("call-uncertain", {})
+
+    assert guard.decide(
+        "call-uncertain", "Leave that message for Priya.", enabled=True,
+    ).kind == "pass"
+    assert guard.snapshot("call-uncertain")["phase"] == "executing"
+    guard.note_tool_result(
+        "call-uncertain", success=False, native_outcome="unknown", dispatch_generation=1,
+    )
+    assert guard.snapshot("call-uncertain")["phase"] == "reconciling"
+    assert guard.decide(
+        "call-uncertain", "Leave that message for Priya.", enabled=True,
+    ).kind == "pass"
+    assert guard.snapshot("call-uncertain")["phase"] == "reconciling"

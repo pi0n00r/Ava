@@ -36,6 +36,12 @@ _MESSAGE_REQUEST_WITHOUT_TARGET_RE = re.compile(
     r"(?:\s+please)?[.!?]*$",
     re.IGNORECASE,
 )
+_REFERENCED_MESSAGE_REQUEST_RE = re.compile(
+    r"(?:^|\b)(?:i(?:'d| would) like to\s+|i want to\s+|can i\s+|could i\s+)?"
+    r"(?:leave|give|take)\s+(?:that|the\s+(?:last|previous))\s+message\s+"
+    r"(?:for|to)\s+(?P<target>.+)$",
+    re.IGNORECASE,
+)
 _MESSAGE_CORRECTION_RE = re.compile(
     r"^(?:(?:no[,;:]?\s*)?(?:change|make)\s+(?:it|that)\s+(?:to|say)\s+|"
     r"(?:no[,;:]?\s*)?(?:instead[,;:]?\s*)?(?:say|tell\s+(?:him|her|them))\s+)"
@@ -145,6 +151,18 @@ def _message_request_target(value: str) -> Optional[str]:
     return target
 
 
+def _referenced_message_request_target(value: str) -> Optional[str]:
+    text = _collapse_text(value)
+    match = _REFERENCED_MESSAGE_REQUEST_RE.search(text)
+    if not match:
+        return None
+    target = _TRAILING_POLITENESS_RE.sub("", match.group("target")).strip(" \t,;:!?.")
+    target = _collapse_text(target)
+    if not target or len(target) > _MAX_TARGET_CHARS:
+        return None
+    return target
+
+
 def _is_message_request_without_target(value: str) -> bool:
     return bool(_MESSAGE_REQUEST_WITHOUT_TARGET_RE.fullmatch(_collapse_text(value)))
 
@@ -204,6 +222,12 @@ class DepositReconciliation:
     envelope_json: str
 
 
+@dataclass(frozen=True, repr=False)
+class _PriorUtterance:
+    text: str
+    observed_at: float
+
+
 @dataclass
 class _DepositState:
     phase: Literal[
@@ -235,20 +259,51 @@ class PipelineMessageDepositGuard:
         clock: Callable[[], float] = time.monotonic,
         confirmed_execution_window_sec: float = 5.0,
         residual_affirmation_window_sec: float = 1.25,
+        prior_utterance_window_sec: float = 180.0,
     ) -> None:
         if confirmed_execution_window_sec <= 0:
             raise ValueError("confirmed_execution_window_sec must be positive")
         if residual_affirmation_window_sec < 0:
             raise ValueError("residual_affirmation_window_sec must be non-negative")
         self._states: Dict[str, _DepositState] = {}
+        if prior_utterance_window_sec <= 0:
+            raise ValueError("prior_utterance_window_sec must be positive")
+        self._prior_utterances: Dict[str, _PriorUtterance] = {}
         self._dispatch_generation = 0
         self._clock = clock
+        self._prior_utterance_window_sec = prior_utterance_window_sec
         # The production tool-selection turn has historically completed in about
         # three seconds. Five seconds allows two seconds for bounded event-loop
         # and local HTTP-dispatch scheduling without leaving a reusable consent
         # token alive across a later caller turn.
         self._confirmed_execution_window_sec = confirmed_execution_window_sec
         self._residual_affirmation_window_sec = residual_affirmation_window_sec
+
+    def _remember_prior_utterance(self, call_id: str, text: str) -> None:
+        """Keep one bounded same-call candidate for an explicit next-turn reference."""
+        key = _intent_key(text)
+        if (
+            not text
+            or len(text) > _MAX_MESSAGE_CHARS
+            or key in (_PRE_MESSAGE_ACKNOWLEDGEMENT | _AFFIRMATIVE | _NEGATIVE | _CANCEL)
+            or key in _MESSAGE_META_REQUESTS
+            or _message_request_target(text) is not None
+            or _referenced_message_request_target(text) is not None
+            or _is_message_request_without_target(text)
+        ):
+            self._prior_utterances.pop(call_id, None)
+            return
+        self._prior_utterances[call_id] = _PriorUtterance(text, self._clock())
+
+    def _take_prior_utterance(self, call_id: str) -> Optional[str]:
+        """Consume one fresh same-call candidate; never reuse it across requests."""
+        prior = self._prior_utterances.pop(call_id, None)
+        if prior is None:
+            return None
+        age = self._clock() - prior.observed_at
+        if age < 0 or age > self._prior_utterance_window_sec:
+            return None
+        return prior.text
 
     def decide(
         self,
@@ -263,6 +318,7 @@ class PipelineMessageDepositGuard:
         """Classify one final caller transcript before it reaches the LLM."""
         if not enabled:
             state = self._states.get(call_id)
+            self._prior_utterances.pop(call_id, None)
             if not state or state.phase not in {"executing", "reconciling"}:
                 self._states.pop(call_id, None)
             return DepositDecision()
@@ -311,11 +367,40 @@ class PipelineMessageDepositGuard:
                           "Who would you like me to leave the message for?"),
                 )
 
+        referenced_target = _referenced_message_request_target(text)
+        if state is None and referenced_target:
+            prior_message = self._take_prior_utterance(call_id)
+            if prior_message is None:
+                self._states[call_id] = _DepositState(
+                    phase="awaiting_message",
+                    target=referenced_target,
+                )
+                return DepositDecision(
+                    kind="speak",
+                    text=f"What would you like me to tell {referenced_target}?",
+                )
+            self._states[call_id] = _DepositState(
+                phase="awaiting_confirmation",
+                target=referenced_target,
+                message=prior_message,
+            )
+            return DepositDecision(kind="speak", text=_quoted_readback(prior_message))
+
         configured_target = _collapse_text(default_target or "")
         if len(configured_target) > _MAX_TARGET_CHARS:
             configured_target = ""
 
         if state and state.phase == "acknowledged":
+            if referenced_target:
+                self._states[call_id] = _DepositState(
+                    phase="awaiting_message",
+                    target=referenced_target,
+                )
+                self._prior_utterances.pop(call_id, None)
+                return DepositDecision(
+                    kind="speak",
+                    text=f"What would you like me to tell {referenced_target}?",
+                )
             target = _message_request_target(text)
             if target:
                 self._states[call_id] = _DepositState(
@@ -355,12 +440,15 @@ class PipelineMessageDepositGuard:
             # Any substantive utterance is a new request.  Release the guard and
             # let the ordinary agent handle it.
             self._states.pop(call_id, None)
+            self._remember_prior_utterance(call_id, text)
             return DepositDecision()
 
         if state is None:
             target = _message_request_target(text)
             if not target and not _is_message_request_without_target(text):
+                self._remember_prior_utterance(call_id, text)
                 return DepositDecision()
+            self._prior_utterances.pop(call_id, None)
             if not target:
                 if configured_target:
                     target = configured_target
@@ -391,6 +479,13 @@ class PipelineMessageDepositGuard:
                     kind="speak",
                     text="Who would you like me to leave the message for?",
                 )
+            if referenced_target:
+                state.target = referenced_target
+                state.message = ""
+                state.phase = "awaiting_message"
+                return DepositDecision(
+                    kind="speak", text=f"What would you like me to tell {referenced_target}?"
+                )
             target = _message_request_target(text)
             if not target:
                 target = re.sub(r"^(?:for|to)\s+", "", text, flags=re.IGNORECASE)
@@ -413,6 +508,13 @@ class PipelineMessageDepositGuard:
                 self._states.pop(call_id, None)
                 return DepositDecision(kind="speak", text="Of course.")
             replacement_target = _message_request_target(text)
+            if referenced_target:
+                state.target = referenced_target
+                state.message = ""
+                return DepositDecision(
+                    kind="speak",
+                    text=f"What would you like me to tell {referenced_target}?",
+                )
             if replacement_target:
                 state.target = replacement_target
                 state.message = ""
@@ -463,11 +565,20 @@ class PipelineMessageDepositGuard:
                 state.message = correction
                 state.confirmed_until = 0.0
                 return DepositDecision(kind="speak", text=_quoted_readback(correction))
+            if referenced_target:
+                state.target = referenced_target
+                state.message = ""
+                state.confirmed_until = 0.0
+                state.phase = "awaiting_message"
+                return DepositDecision(
+                    kind="speak", text=f"What would you like me to tell {referenced_target}?"
+                )
             if caller_controls:
                 # An unrelated caller turn is conversation, not another demand
                 # for confirmation. Discard the draft so a later Yes cannot
                 # authorize the former payload.
                 self._states.pop(call_id, None)
+                self._remember_prior_utterance(call_id, text)
                 return DepositDecision()
             return DepositDecision(
                 kind="speak",
@@ -482,6 +593,7 @@ class PipelineMessageDepositGuard:
                 return DepositDecision(kind="suppress")
             if caller_controls:
                 self._states.pop(call_id, None)
+                self._remember_prior_utterance(call_id, text)
                 return DepositDecision()
             # A new substantive caller turn revokes the unspent confirmation.
             # The utterance still reaches the ordinary dialog model, but a tool
@@ -680,6 +792,7 @@ class PipelineMessageDepositGuard:
 
     def cleanup(self, call_id: str) -> None:
         """Discard all caller text when the call ends."""
+        self._prior_utterances.pop(call_id, None)
         self._states.pop(call_id, None)
 
     def snapshot(self, call_id: str) -> Optional[dict]:
