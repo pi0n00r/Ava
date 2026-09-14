@@ -35,7 +35,8 @@ class FakeNative:
     def start(self): self.events.append("start"); self.running = True
     def agent_snapshot(self, include_backup=False):
         self.events.append("snapshot_backup" if include_backup else "snapshot")
-        return (copy.deepcopy(self.logical), self.database) if include_backup else copy.deepcopy(self.logical)
+        evidence = {"sha256": deploy.sha256(self.database), "size": len(self.database)}
+        return (copy.deepcopy(self.logical), self.database, evidence) if include_backup else copy.deepcopy(self.logical)
     def health(self):
         self.events.append("health")
         if self.fail_post_health and self.events.count("start"):
@@ -58,6 +59,7 @@ class ActivationTests(unittest.TestCase):
         self.after = deploy.fingerprint(self.candidate / "engine.py")
         self.patches = [mock.patch.object(deploy, "BEFORE", deploy.stable(self.before)),
                         mock.patch.object(deploy, "AFTER", deploy.stable(self.after)),
+                        mock.patch.object(deploy, "SOURCE", {k: self.after[k] for k in ("sha256", "size", "mode")}),
                         mock.patch.object(deploy, "OWNER", owner), mock.patch.object(deploy, "BACKUP_BASE", self.backups)]
         for patch in self.patches: patch.start(); self.addCleanup(patch.stop)
 
@@ -148,7 +150,39 @@ class NativeContractTests(unittest.TestCase):
             deploy.Native().agent_snapshot()
         body = run.call_args.kwargs["body"].decode()
         self.assertIn("mode=ro", body); self.assertIn("c.backup(d)", body)
+        self.assertIn("EngineAgentStore().db_path", body)
+        self.assertNotIn('p="/app/data/operator/agents.db"', body)
         self.assertNotIn("delete from", body.lower()); self.assertNotIn("update agents", body.lower())
+
+    def test_native_backup_response_returns_same_logical_shape(self):
+        database = b"SQLite format 3 native fixture"
+        response = {"sha256": "a" * 64, "agent_count": 1, "columns": ["slug"],
+                    "backup_b64": __import__("base64").b64encode(database).decode(),
+                    "backup_sha256": deploy.sha256(database), "backup_size": len(database)}
+        with mock.patch.object(deploy.Native, "run", return_value=json.dumps(response).encode()):
+            logical, returned, evidence = deploy.Native().agent_snapshot(include_backup=True)
+        self.assertEqual(logical, {"sha256": "a" * 64, "agent_count": 1, "columns": ["slug"]})
+        self.assertEqual(returned, database)
+        self.assertEqual(evidence, {"sha256": deploy.sha256(database), "size": len(database)})
+        self.assertNotIn("backup_sha256", logical); self.assertNotIn("backup_size", logical)
+
+    def test_prepared_runtime_candidate_checks_owner_group_mode_and_size(self):
+        seen = []
+        original = deploy.atomic_bytes
+        def capture(path, data, metadata, before_replace=None):
+            if before_replace is not None:
+                def wrapped(identity):
+                    seen.append(deploy.stable(identity)); before_replace(identity)
+                return original(path, data, metadata, wrapped)
+            return original(path, data, metadata, before_replace)
+        # The full fixture transaction verifies the staged file before rename.
+        case = ActivationTests("test_exact_single_engine_apply_and_rollback_never_restore_database")
+        case.setUp()
+        try:
+            with mock.patch.object(deploy, "atomic_bytes", side_effect=capture): case.apply()
+            self.assertIn(deploy.AFTER, seen)
+        finally:
+            case.doCleanups()
 
     def test_health_and_control_surface_is_bounded(self):
         source = Path(deploy.__file__).read_text()
@@ -161,6 +195,8 @@ class NativeContractTests(unittest.TestCase):
             self.assertEqual(deploy.Native().pbx_channels(), result)
         body = run.call_args.kwargs["body"].decode()
         self.assertIn("inject_asterisk_credentials", body); self.assertIn('method="GET"', body)
+        self.assertIn("pbx_readback_shape", body)
+        self.assertNotIn("assert ", body)
         self.assertNotIn("POST", body)
 
 

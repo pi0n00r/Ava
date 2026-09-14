@@ -29,6 +29,7 @@ BEFORE = {"sha256": "4d9da9e3b076aa399152f11a4c68c8e11922d87f6e892b27d0717b63f73
           "size": 1115279, "mode": "0644", **OWNER}
 AFTER = {"sha256": "b0af355fab439b3d6eb08eabf33df5adc1a8d77d4dfd5b5921b0d9085cb7ac4a",
          "size": 1116285, "mode": "0644", **OWNER}
+SOURCE = {k: AFTER[k] for k in ("sha256", "size", "mode")}
 
 
 class Blocked(Exception):
@@ -82,7 +83,8 @@ def atomic_bytes(path, data, metadata, before_replace=None):
                 os.utime(stream.fileno(), ns=(value, value))
             os.fsync(stream.fileno())
         if before_replace:
-            before_replace()
+            temporary_id = fingerprint(Path(temporary))
+            before_replace(temporary_id)
         os.replace(temporary, path)
         directory = os.open(path.parent, os.O_DIRECTORY)
         try:
@@ -144,7 +146,8 @@ class Native:
 
     def agent_snapshot(self, include_backup=False):
         code = r'''import base64,hashlib,json,sqlite3,tempfile,os
-p="/app/data/operator/agents.db"
+from src.core.agent_store import EngineAgentStore
+p=EngineAgentStore().db_path
 c=sqlite3.connect("file:"+p+"?mode=ro",uri=True)
 cols=[r[1] for r in c.execute("pragma table_info(agents)")]
 keep=[v for v in cols if v != "updated_at"]
@@ -169,8 +172,11 @@ print(json.dumps(out,sort_keys=True))'''
                 data = base64.b64decode(value.pop("backup_b64"), validate=True)
                 if sha256(data) != value["backup_sha256"] or len(data) != value["backup_size"]:
                     raise ValueError
-                return value, data
-            return value
+                evidence = {"sha256": value.pop("backup_sha256"),
+                            "size": value.pop("backup_size")}
+                logical = {k: value[k] for k in ("sha256", "agent_count", "columns")}
+                return logical, data, evidence
+            return {k: value[k] for k in ("sha256", "agent_count", "columns")}
         except (KeyError, TypeError, ValueError):
             raise Blocked("logical_agent_snapshot_malformed") from None
 
@@ -198,7 +204,8 @@ url=f'{a["scheme"]}://{a["host"]}:{a["port"]}/ari/channels'
 h=base64.b64encode((a["username"]+":"+a["password"]).encode()).decode()
 ctx=None if a["ssl_verify"] else ssl._create_unverified_context()
 with urllib.request.urlopen(urllib.request.Request(url,headers={"Authorization":"Basic "+h},method="GET"),timeout=5,context=ctx) as r:
- rows=json.loads(r.read(1048577));assert r.status==200 and isinstance(rows,list)
+ rows=json.loads(r.read(1048577))
+ if r.status != 200 or not isinstance(rows,list): raise ValueError("pbx_readback_shape")
 print(json.dumps({"authenticated":True,"operation":"GET /ari/channels","channels":len(rows)}))'''
         raw = self.run(["docker", "exec", "-i", "ai_engine", "python", "-B", "-"],
                        "native_pbx_readback", body=code.encode(), timeout=10)
@@ -231,7 +238,7 @@ def check(native, root=LIVE_ROOT, candidate=CANDIDATE_ROOT):
     if before is None or stable(before) != BEFORE:
         raise Blocked("live_engine_preimage_mismatch")
     candidate_id = fingerprint(candidate / TARGET)
-    if candidate_id is None or stable(candidate_id) != AFTER:
+    if candidate_id is None or {k: candidate_id[k] for k in SOURCE} != SOURCE:
         raise Blocked("candidate_engine_mismatch")
     source = (candidate / TARGET).read_bytes()
     compile(source, TARGET, "exec")
@@ -277,7 +284,7 @@ def apply(native, root=LIVE_ROOT, candidate=CANDIDATE_ROOT, base=BACKUP_BASE):
     checked = check(native, root, candidate)
     safe_path(base); base.mkdir(parents=True, exist_ok=True)
     backup = Path(tempfile.mkdtemp(prefix="http-advert-fbb1e2d-", dir=base)); os.chmod(backup, 0o700)
-    snapshot, database = native.agent_snapshot(include_backup=True)
+    snapshot, database, database_evidence = native.agent_snapshot(include_backup=True)
     if snapshot != checked["logical_agent_config"]:
         raise Blocked("logical_agent_config_changed_before_capture")
     atomic_bytes(backup / TARGET, (root / TARGET).read_bytes(), checked["before"])
@@ -288,7 +295,7 @@ def apply(native, root=LIVE_ROOT, candidate=CANDIDATE_ROOT, base=BACKUP_BASE):
                "before": checked["before"], "postimage": None, "container": checked["anchor"],
                "preflight_health": checked["health"], "logical_agent_config": snapshot,
                "agents_db_backup": {"evidence_only": True, "restored": False,
-                                    "sha256": sha256(database), "size": len(database)},
+                                    **database_evidence},
                "status": "captured"}
     save_json(backup / "transaction.json", receipt)
     try:
@@ -297,9 +304,11 @@ def apply(native, root=LIVE_ROOT, candidate=CANDIDATE_ROOT, base=BACKUP_BASE):
             raise Blocked("pre_stop_state_changed")
         require_container(native, checked["anchor"], running=True); native.stop()
         require_container(native, checked["anchor"], running=False)
-        def journal():
+        def journal(temporary_id):
             if fingerprint(root / TARGET) != checked["before"]:
                 raise Blocked("pre_replace_engine_changed")
+            if stable(temporary_id) != AFTER:
+                raise Blocked("prepared_runtime_candidate_mismatch")
         receipt["postimage"] = atomic_bytes(root / TARGET, checked["source"], AFTER, journal)
         save_json(backup / "transaction.json", receipt)
         native.start(); require_container(native, checked["anchor"], running=True)
