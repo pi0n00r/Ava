@@ -1,3 +1,7 @@
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Project=Ava
+
 import asyncio
 import base64
 import json

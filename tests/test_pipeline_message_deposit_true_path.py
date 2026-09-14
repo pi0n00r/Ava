@@ -1,3 +1,7 @@
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Project=Ava
+
 import asyncio
 import contextlib
 import json
@@ -320,7 +324,7 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
     call_id = str(uuid.uuid4())
     session = CallSession(call_id=call_id, caller_channel_id=call_id)
     session.pipeline_name = "true_path"
-    session.context_name = "machine"
+    session.context_name = "aimee_main" if direct_confirmation else "machine"
     session.allowed_tools = ["deposit_preflight", "pbx_message_deposit"]
     session.audio_capture_enabled = True
     session.caller_name = "Synthetic caller"
@@ -461,8 +465,31 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
     await writer.drain()
     await asyncio.wait_for(inbound_handler_seen.wait(), timeout=2)
 
-    await stt.results.put("I'd like to leave a message for Gary, please.")
-    await _wait_until(lambda: "Of course. What would you like me to tell Gary?" in tts.texts)
+    request_text = (
+        "I'd like to leave a message."
+        if direct_confirmation
+        else "I'd like to leave a message for Gary, please."
+    )
+    await stt.results.put(request_text)
+    if direct_confirmation:
+        target_question = "Of course. Who would you like me to leave the message for?"
+        await _wait_until(lambda: target_question in tts.texts)
+        await _wait_until(lambda: not engine.streaming_playback_manager.active_streams)
+        await stt.results.put("Gary.")
+    content_question = (
+        "What would you like me to tell Gary?"
+        if direct_confirmation
+        else "Of course. What would you like me to tell Gary?"
+    )
+    await _wait_until(lambda: content_question in tts.texts)
+    if direct_confirmation:
+        await _wait_until(lambda: not engine.streaming_playback_manager.active_streams)
+        await stt.results.put("Okay, thanks.")
+        await _wait_until(lambda: tts.texts.count("What would you like me to tell Gary?") >= 2)
+        await _wait_until(lambda: not engine.streaming_playback_manager.active_streams)
+        assert not request_seen.is_set()
+        assert requests == []
+        assert not any("Okay, thanks" in text for text in tts.texts)
     await _wait_until(lambda: not engine.streaming_playback_manager.active_streams)
     await stt.results.put("The sky is blue.")
     exact_readback = "I have: “The sky is blue.” Is that right?"

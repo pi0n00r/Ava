@@ -1,3 +1,7 @@
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Project=Ava
+
 import asyncio
 import contextlib
 import copy
@@ -15848,6 +15852,9 @@ class Engine:
                         call_id,
                         transcript_text,
                         enabled="pbx_message_deposit" in configured_tool_names,
+                        default_target=(llm_options or {}).get(
+                            "message_deposit_default_target"
+                        ),
                     )
                     if deposit_decision.kind == "suppress":
                         logger.info(
@@ -17301,8 +17308,12 @@ class Engine:
                             return
                     if not from_flush:
                         await cancel_flush()
-                    await run_turn(aggregated)
                     pending_segments.clear()
+                    # Detach this completed utterance before any response audio
+                    # reopens capture. A short next utterance can otherwise be
+                    # appended while run_turn is still draining TTS and become
+                    # part of the already-consumed turn.
+                    await run_turn(aggregated)
 
                 async def schedule_flush() -> None:
                     nonlocal flush_task

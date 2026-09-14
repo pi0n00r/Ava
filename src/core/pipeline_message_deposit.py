@@ -1,3 +1,7 @@
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Project=Ava
+
 """Deterministic caller-facing state for the managed message-deposit tool.
 
 The LLM remains responsible for ordinary conversation, but it must not be the
@@ -22,6 +26,23 @@ _MAX_MESSAGE_CHARS = 300
 _MESSAGE_REQUEST_RE = re.compile(
     r"(?:^|\b)(?:i(?:'d| would) like to\s+|i want to\s+|can i\s+|could i\s+)?"
     r"(?:leave|give|take)\s+(?:a\s+)?message\s+(?:for|to)\s+(?P<target>.+)$",
+    re.IGNORECASE,
+)
+_MESSAGE_REQUEST_WITHOUT_TARGET_RE = re.compile(
+    r"^(?:i(?:'d| would)?\s+like\s+to\s+|i\s+want\s+to\s+|"
+    r"can\s+i\s+|could\s+i\s+|may\s+i\s+|please\s+)?"
+    r"(?:leave|give|take)\s+(?:a\s+)?message"
+    r"(?:\s+please)?[.!?]*$",
+    re.IGNORECASE,
+)
+_MESSAGE_CORRECTION_RE = re.compile(
+    r"^(?:(?:no[,;:]?\s*)?(?:change|make)\s+(?:it|that)\s+(?:to|say)\s+|"
+    r"(?:no[,;:]?\s*)?(?:instead[,;:]?\s*)?(?:say|tell\s+(?:him|her|them))\s+)"
+    r"(?P<message>.+)$",
+    re.IGNORECASE,
+)
+_EXPLICIT_MESSAGE_CONTENT_RE = re.compile(
+    r"^(?:the\s+message\s+is|my\s+message\s+is|message)\s*[:,-]?\s*(?P<message>.+)$",
     re.IGNORECASE,
 )
 _TRAILING_POLITENESS_RE = re.compile(
@@ -77,6 +98,18 @@ _CANCEL = {
     "never mind",
     "nevermind",
 }
+_PRE_MESSAGE_ACKNOWLEDGEMENT = {
+    "all right",
+    "alright",
+    "okay",
+    "okay please",
+    "okay thanks",
+    "okay thank you",
+    "please",
+    "sure",
+    "thanks",
+    "thank you",
+}
 
 
 def _collapse_text(value: str) -> str:
@@ -105,6 +138,37 @@ def _message_request_target(value: str) -> Optional[str]:
     return target
 
 
+def _is_message_request_without_target(value: str) -> bool:
+    return bool(_MESSAGE_REQUEST_WITHOUT_TARGET_RE.fullmatch(_collapse_text(value)))
+
+
+def _message_correction(value: str) -> Optional[str]:
+    match = _MESSAGE_CORRECTION_RE.fullmatch(_collapse_text(value))
+    if not match:
+        return None
+    message = _collapse_text(match.group("message"))
+    if not message or len(message) > _MAX_MESSAGE_CHARS:
+        return None
+    return message
+
+
+def _explicit_message_content(value: str, target: str) -> Optional[str]:
+    text = _collapse_text(value)
+    match = _EXPLICIT_MESSAGE_CONTENT_RE.fullmatch(text)
+    if not match and target:
+        match = re.fullmatch(
+            rf"tell\s+{re.escape(target)}\s*[:,-]?\s*(?P<message>.+)",
+            text,
+            flags=re.IGNORECASE,
+        )
+    if not match:
+        return None
+    message = _collapse_text(match.group("message"))
+    if not message or len(message) > _MAX_MESSAGE_CHARS:
+        return None
+    return message
+
+
 def _quoted_readback(value: str) -> str:
     # Keep the caller's normalized words verbatim.  Use ASCII quotes internally
     # so caller-supplied curly quotes cannot terminate the spoken outer quote.
@@ -126,6 +190,7 @@ class DepositDecision:
 @dataclass
 class _DepositState:
     phase: Literal[
+        "awaiting_target",
         "awaiting_message",
         "awaiting_confirmation",
         "depositing",
@@ -167,6 +232,7 @@ class PipelineMessageDepositGuard:
         transcript: str,
         *,
         enabled: bool,
+        default_target: Optional[str] = None,
     ) -> DepositDecision:
         """Classify one final caller transcript before it reaches the LLM."""
         if not enabled:
@@ -179,6 +245,10 @@ class PipelineMessageDepositGuard:
         key = _intent_key(text)
         state = self._states.get(call_id)
 
+        configured_target = _collapse_text(default_target or "")
+        if len(configured_target) > _MAX_TARGET_CHARS:
+            configured_target = ""
+
         if state and state.phase == "acknowledged":
             target = _message_request_target(text)
             if target:
@@ -189,6 +259,24 @@ class PipelineMessageDepositGuard:
                 return DepositDecision(
                     kind="speak",
                     text=f"Of course. What would you like me to tell {target}?",
+                )
+            if _is_message_request_without_target(text):
+                if configured_target:
+                    self._states[call_id] = _DepositState(
+                        phase="awaiting_message",
+                        target=configured_target,
+                    )
+                    return DepositDecision(
+                        kind="speak",
+                        text=f"Of course. What would you like me to tell {configured_target}?",
+                    )
+                self._states[call_id] = _DepositState(
+                    phase="awaiting_target",
+                    target="",
+                )
+                return DepositDecision(
+                    kind="speak",
+                    text="Of course. Who would you like me to leave the message for?",
                 )
             if key in _AFFIRMATIVE:
                 # A short affirmation may have been spoken over the verified
@@ -205,8 +293,20 @@ class PipelineMessageDepositGuard:
 
         if state is None:
             target = _message_request_target(text)
-            if not target:
+            if not target and not _is_message_request_without_target(text):
                 return DepositDecision()
+            if not target:
+                if configured_target:
+                    target = configured_target
+                else:
+                    self._states[call_id] = _DepositState(
+                        phase="awaiting_target",
+                        target="",
+                    )
+                    return DepositDecision(
+                        kind="speak",
+                        text="Of course. Who would you like me to leave the message for?",
+                    )
             self._states[call_id] = _DepositState(
                 phase="awaiting_message",
                 target=target,
@@ -216,18 +316,64 @@ class PipelineMessageDepositGuard:
                 text=f"Of course. What would you like me to tell {target}?",
             )
 
+        if state.phase == "awaiting_target":
+            if key in _CANCEL:
+                self._states.pop(call_id, None)
+                return DepositDecision(kind="speak", text="Of course.")
+            if _is_message_request_without_target(text) or key in _PRE_MESSAGE_ACKNOWLEDGEMENT:
+                return DepositDecision(
+                    kind="speak",
+                    text="Who would you like me to leave the message for?",
+                )
+            target = _message_request_target(text)
+            if not target:
+                target = re.sub(r"^(?:for|to)\s+", "", text, flags=re.IGNORECASE)
+                target = _TRAILING_POLITENESS_RE.sub("", target).strip(" \t,;:!?.")
+                target = _collapse_text(target)
+            if not target or len(target) > _MAX_TARGET_CHARS:
+                return DepositDecision(
+                    kind="speak",
+                    text="Who would you like me to leave the message for?",
+                )
+            state.target = target
+            state.phase = "awaiting_message"
+            return DepositDecision(
+                kind="speak",
+                text=f"What would you like me to tell {target}?",
+            )
+
         if state.phase == "awaiting_message":
             if key in _CANCEL:
                 self._states.pop(call_id, None)
                 return DepositDecision(kind="speak", text="Of course.")
-            if len(text) > _MAX_MESSAGE_CHARS:
+            replacement_target = _message_request_target(text)
+            if replacement_target:
+                state.target = replacement_target
+                state.message = ""
+                return DepositDecision(
+                    kind="speak",
+                    text=f"What would you like me to tell {replacement_target}?",
+                )
+            if _is_message_request_without_target(text):
+                return DepositDecision(
+                    kind="speak",
+                    text=f"What would you like me to tell {state.target}?",
+                )
+            explicit_message = _explicit_message_content(text, state.target)
+            if key in _PRE_MESSAGE_ACKNOWLEDGEMENT and not explicit_message:
+                return DepositDecision(
+                    kind="speak",
+                    text=f"What would you like me to tell {state.target}?",
+                )
+            message = explicit_message or text
+            if len(message) > _MAX_MESSAGE_CHARS:
                 return DepositDecision(
                     kind="speak",
                     text="That is too long for me to read back safely. What shorter message would you like me to take?",
                 )
-            state.message = text
+            state.message = message
             state.phase = "awaiting_confirmation"
-            return DepositDecision(kind="speak", text=_quoted_readback(text))
+            return DepositDecision(kind="speak", text=_quoted_readback(message))
 
         if state.phase == "awaiting_confirmation":
             if key in _CANCEL:
@@ -246,6 +392,10 @@ class PipelineMessageDepositGuard:
                     self._clock() + self._confirmed_execution_window_sec
                 )
                 return DepositDecision()
+            correction = _message_correction(text)
+            if correction:
+                state.message = correction
+                return DepositDecision(kind="speak", text=_quoted_readback(correction))
             return DepositDecision(
                 kind="speak",
                 text="Was that right? You can say yes, or tell me what to change.",

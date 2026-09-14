@@ -1,3 +1,7 @@
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Project=Ava
+
 from src.core.pipeline_message_deposit import PipelineMessageDepositGuard
 
 
@@ -221,3 +225,109 @@ def test_residual_affirmation_suppression_expires_monotonically():
     now[0] = 101.26
     assert guard.decide("call-expiry", "Yes please.", enabled=True).kind == "pass"
     assert guard.snapshot("call-expiry") is None
+
+
+def test_explicit_dictation_preserves_a_short_polite_message():
+    guard = PipelineMessageDepositGuard()
+    guard.decide("call-polite-content", "Leave a message.", enabled=True)
+    guard.decide("call-polite-content", "Gary.", enabled=True)
+
+    readback = guard.decide(
+        "call-polite-content",
+        "Tell Gary: Okay thanks",
+        enabled=True,
+    )
+    assert readback.text == "I have: “Okay thanks” Is that right?"
+    guard.decide("call-polite-content", "Yes.", enabled=True)
+    assert guard.consume_confirmed_tool_parameters("call-polite-content", {}) == {
+        "target": "Gary",
+        "message": "Okay thanks",
+    }
+
+
+def test_optional_structured_default_target_skips_only_the_recipient_question():
+    guard = PipelineMessageDepositGuard()
+    ask = guard.decide(
+        "call-default",
+        "I like to leave a message.",
+        enabled=True,
+        default_target="Gary",
+    )
+    assert ask.text == "Of course. What would you like me to tell Gary?"
+    assert guard.snapshot("call-default") == {
+        "phase": "awaiting_message",
+        "has_target": True,
+        "has_message": False,
+    }
+
+
+def test_targetless_intent_without_default_asks_for_recipient_first():
+    guard = PipelineMessageDepositGuard()
+
+    who = guard.decide("call-who", "May I leave a message please?", enabled=True)
+    assert who.text == "Of course. Who would you like me to leave the message for?"
+    assert guard.snapshot("call-who")["phase"] == "awaiting_target"
+
+    assert guard.decide("call-who", "Okay.", enabled=True).text == (
+        "Who would you like me to leave the message for?"
+    )
+    target = guard.decide("call-who", "For Priya, please.", enabled=True)
+    assert target.text == "What would you like me to tell Priya?"
+    assert guard.snapshot("call-who")["phase"] == "awaiting_message"
+
+
+def test_full_named_request_while_awaiting_target_or_content_rebinds_recipient():
+    guard = PipelineMessageDepositGuard()
+    guard.decide("call-rebind", "Leave a message.", enabled=True)
+
+    named = guard.decide(
+        "call-rebind",
+        "I'd like to leave a message for Gary, please.",
+        enabled=True,
+    )
+    assert named.text == "What would you like me to tell Gary?"
+
+    replacement = guard.decide(
+        "call-rebind",
+        "Actually, leave a message for Priya.",
+        enabled=True,
+    )
+    assert replacement.text == "What would you like me to tell Priya?"
+    assert guard.snapshot("call-rebind") == {
+        "phase": "awaiting_message",
+        "has_target": True,
+        "has_message": False,
+    }
+    readback = guard.decide("call-rebind", "Call tomorrow.", enabled=True)
+    assert readback.text == "I have: “Call tomorrow.” Is that right?"
+
+
+def test_explicit_correction_replaces_content_and_requires_fresh_confirmation():
+    guard = PipelineMessageDepositGuard()
+    guard.decide("call-correction", "Leave a message for Gary.", enabled=True)
+    guard.decide("call-correction", "The sky is green.", enabled=True)
+
+    correction = guard.decide(
+        "call-correction",
+        "No, change it to the sky is blue.",
+        enabled=True,
+    )
+    assert correction.text == "I have: “the sky is blue.” Is that right?"
+    assert guard.snapshot("call-correction")["phase"] == "awaiting_confirmation"
+    with __import__("pytest").raises(ValueError, match="not_confirmed"):
+        guard.consume_confirmed_tool_parameters("call-correction", {})
+
+    guard.decide("call-correction", "Yes.", enabled=True)
+    assert guard.consume_confirmed_tool_parameters("call-correction", {}) == {
+        "target": "Gary",
+        "message": "the sky is blue.",
+    }
+
+
+def test_targetless_state_is_call_scoped_and_cleanup_revokes_it():
+    guard = PipelineMessageDepositGuard()
+    guard.decide("call-a", "Leave a message.", enabled=True)
+    assert guard.decide("call-b", "The sky is blue.", enabled=True).kind == "pass"
+    assert guard.snapshot("call-b") is None
+    guard.cleanup("call-a")
+    assert guard.snapshot("call-a") is None
