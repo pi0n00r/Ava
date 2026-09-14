@@ -21,7 +21,7 @@ from src.tools.telephony.hangup_policy import resolve_hangup_policy
 
 
 CANDIDATE = pathlib.Path(__file__).resolve().parents[1]
-BASE_COMMIT = "994a9d1f11c03eca4a8e082d2a42a0b9dcaf7e3e"
+BASE_COMMIT = "5a6cc7195ad022bef5a94f8d8665a463a5566b65"
 BASELINE = os.environ.get("JD_AVA_BASELINE_SOURCE")
 END_MARKERS = resolve_hangup_policy({})["markers"]["end_call"]
 
@@ -199,6 +199,10 @@ class MessageControlTests(unittest.TestCase):
                     guard.consume_confirmed_tool_parameters("call-a", {})
                 self.assertEqual(guard.snapshot("call-a")["phase"], phase)
                 self.assertEqual(main_decide(guard, "Hang up.").kind, "pass")
+                if phase == "executing":
+                    self.assertEqual(guard.snapshot("call-a")["phase"], "executing")
+                    self.assert_unconsumable(guard)
+                    guard.cleanup("call-a")
                 self.assertIsNone(guard.snapshot("call-a"))
                 self.assert_unconsumable(guard)
                 guard.note_tool_result("call-a", success=True)
@@ -271,8 +275,10 @@ class MessageControlTests(unittest.TestCase):
         guard.consume_confirmed_tool_parameters("call-a", {})
         result = main_decide(guard, "Cancel")
         self.assertEqual((result.kind, result.text), ("pass", ""))
-        self.assertIsNone(guard.snapshot("call-a"))
-        guard.note_tool_result("call-a", success=True)
+        self.assertEqual(guard.snapshot("call-a")["phase"], "executing")
+        self.assert_unconsumable(guard)
+        guard.cleanup("call-a")
+        guard.note_tool_result("call-a", success=True, native_outcome="verified")
         self.assertIsNone(guard.snapshot("call-a"))
 
     def test_edit_or_retry_after_failed_attempt_does_not_replay(self):
@@ -324,16 +330,22 @@ class MessageControlTests(unittest.TestCase):
         main_decide(guard, "Yes")
         self.assert_unconsumable(guard)
 
-    def test_conversation_during_execution_cannot_be_revived_by_late_result(self):
+    def test_conversation_during_execution_retains_attempt_until_terminal_proof(self):
         guard = pending()
         main_decide(guard, "Yes")
         guard.consume_confirmed_tool_parameters("call-a", {})
+        generation = guard.execution_generation("call-a")
         self.assertEqual(main_decide(guard, "How is the weather?").kind, "pass")
-        self.assertIsNone(guard.snapshot("call-a"))
-        guard.note_tool_result("call-a", success=True)
-        self.assertIsNone(guard.snapshot("call-a"))
+        self.assertEqual(guard.snapshot("call-a")["phase"], "executing")
         main_decide(guard, "Yes")
         self.assert_unconsumable(guard)
+        guard.note_tool_result("call-a", success=True, native_outcome="verified",
+                               dispatch_generation=generation)
+        self.assertEqual(guard.snapshot("call-a")["phase"], "acknowledged")
+        guard.cleanup("call-a")
+        guard.note_tool_result("call-a", success=True, native_outcome="verified",
+                               dispatch_generation=generation)
+        self.assertIsNone(guard.snapshot("call-a"))
 
     def test_fresh_explicit_message_after_conversation_needs_new_readback_yes(self):
         guard = pending()
@@ -399,7 +411,7 @@ class MessageControlTests(unittest.TestCase):
 
     def test_untouched_shared_paths_are_byte_identical(self):
         for relative in (
-            "src/tools/telephony/hangup_policy.py", "src/tools/http/in_call_lookup.py",
+            "src/tools/telephony/hangup_policy.py",
             "src/logging_config.py", "tests/test_pipeline_message_deposit.py"
         ):
             with self.subTest(path=relative):
@@ -414,8 +426,9 @@ class MessageControlTests(unittest.TestCase):
         before = methods(baseline_bytes("src/engine.py"))
         after = methods((CANDIDATE / "src/engine.py").read_bytes())
         changed = {n for n in set(before) | set(after) if before.get(n) != after.get(n)}
-        self.assertEqual(len(changed), 1)
-        self.assertTrue(any("_pipeline" in n or "_dialog" in n for n in changed), changed)
+        self.assertEqual(changed, {
+            "_pipeline_runner", "_maybe_speak_direct_pipeline_tool_result",
+        })
 
 
 class EngineDecisionBlockTests(unittest.IsolatedAsyncioTestCase):

@@ -109,6 +109,20 @@ class _NoConfirmationInference(LLMComponent):
         raise AssertionError("confirmed deposit must not start streaming inference")
         yield ""
 
+class _PendingBargeInLLM(LLMComponent):
+    """Native cognition can select PBX, never replace the pending envelope."""
+
+    supports_streaming = False
+
+    def __init__(self):
+        self.calls = 0
+        self.stream_calls = 0
+
+    async def generate(self, call_id, transcript, context, options):
+        self.calls += 1
+        assert transcript in ("Leave a message for Gary.", "Did you get that?")
+        return _DepositLLM._deposit_call()
+
 
 class _RecordingTTS(TTSComponent):
     downstream_mode_override = "stream"
@@ -195,10 +209,18 @@ async def _wait_until(predicate, timeout=3.0):
         (False, True, "cancel"),
         (False, True, "http-failure"),
         (False, True, "missing-spoken-response"),
+        (False, True, "barge-in-pending"),
+        (False, True, "terminal-tts-correction"),
+        (False, True, "terminal-tts-unchanged-retry"),
+        (False, True, "barge-in-terminal-absence"),
     ],
     ids=[
         "legacy-primary", "legacy-followup", "main-direct-confirmation",
         "main-pending-cancel", "main-http-failure", "main-invalid-direct-result",
+        "main-barge-in-pending",
+        "main-terminal-tts-correction",
+        "main-terminal-tts-unchanged-retry",
+        "main-barge-in-terminal-absence",
     ],
 )
 @pytest.mark.asyncio
@@ -213,12 +235,16 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
     monkeypatch.setenv("CALL_HISTORY_DB_PATH", str(tmp_path / "call_history.db"))
     monkeypatch.delenv("AAVA_AUDIO_DIAGNOSTICS", raising=False)
     requests = []
+    reconcile_requests = []
+    native_receipts = []
     preflight_requests = []
     request_seen = asyncio.Event()
     response_at = [0.0]
     guard_time = [100.0]
     release_cancelled_http = asyncio.Event()
     cancelled_http_done = asyncio.Event()
+    original_finished = asyncio.Event()
+    terminal_absent = [False]
     failure_phrase = "I'm sorry, I couldn't deposit your message."
     http_timeout_totals = []
     if direct_confirmation:
@@ -240,13 +266,35 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
                 content_length = int(line.split(":", 1)[1].strip())
         body = await reader.readexactly(content_length)
         decoded = json.loads(body)
+        status_line = b"HTTP/1.1 200 OK\r\n"
         if request_path == "/preflight":
             preflight_requests.append(decoded)
             payload = json.dumps({"message": "preflight complete"}).encode()
+        elif request_path == "/v1/message-deposit/reconcile":
+            reconcile_requests.append(decoded)
+            if terminal_absent[0]:
+                data = {"ok": False, "status": "definitively_not_found",
+                        "artifact_verified": False, "replay": False}
+                status_line = b"HTTP/1.1 404 Not Found\r\n"
+            elif original_finished.is_set():
+                data = {
+                    "ok": True, "status": "verified_saved",
+                    "artifact_verified": True, "replay": True,
+                    "native_id": "fixture-native-artifact",
+                }
+            else:
+                data = {
+                    "ok": False, "status": "pending_or_ambiguous",
+                    "artifact_verified": False, "replay": False, "error": "helper_timeout",
+                }
+                status_line = b"HTTP/1.1 202 Pending\r\n"
+            payload = json.dumps(data).encode()
         else:
             requests.append(decoded)
             if direct_confirmation:
                 assert engine._pipeline_message_deposit_guard().snapshot(call_id)["phase"] == "executing"
+                state = engine._pipeline_message_deposit_guard()._states[call_id]
+                assert json.loads(state.dispatched_envelope) == decoded
                 guard_time[0] += 54.0
             request_seen.set()
             if outcome == "cancel":
@@ -255,22 +303,44 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
                 await writer.wait_closed()
                 cancelled_http_done.set()
                 return
+            if outcome in {"barge-in-pending", "barge-in-terminal-absence"}:
+                await release_cancelled_http.wait()
             await asyncio.sleep(0.36)
             response_at[0] = time.monotonic()
             data = {"spoken_response": "I'll make sure Gary gets it."}
+            if direct_confirmation:
+                data.update({
+                    "ok": True, "status": "saved", "artifact_verified": True,
+                    "replay": False, "native_id": "fixture-native-artifact",
+                })
             if outcome == "missing-spoken-response":
-                data = {"untrusted_result": "Never speak this as success."}
+                data.pop("spoken_response", None)
+                data["untrusted_result"] = "Never speak this as success."
+            if outcome == "http-failure":
+                data = {"ok": False, "error": "helper_timeout"}
+                status_line = b"HTTP/1.1 502 Failed\r\n"
+            if outcome in {"terminal-tts-correction", "terminal-tts-unchanged-retry", "barge-in-terminal-absence"} and len(requests) == 1:
+                data = {"ok": False, "error": "tts_request_failed"}
+                status_line = b"HTTP/1.1 502 Failed\r\n"
+                terminal_absent[0] = True
+            elif data.get("artifact_verified") is True:
+                terminal_absent[0] = False
+            if outcome == "terminal-tts-unchanged-retry" and len(requests) > 1:
+                data["replay"] = len(requests) > 2
+                native_receipts.append(dict(data))
             payload = json.dumps(data).encode()
-        status_line = b"HTTP/1.1 500 Failed\r\n" if outcome == "http-failure" else b"HTTP/1.1 200 OK\r\n"
         writer.write(
             status_line + b"Content-Type: application/json\r\nContent-Length: "
             + str(len(payload)).encode()
             + b"\r\nConnection: close\r\n\r\n"
             + payload
         )
-        await writer.drain()
-        writer.close()
-        await writer.wait_closed()
+        with contextlib.suppress(ConnectionError):
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+        if request_path == "/v1/message-deposit" and outcome in {"barge-in-pending", "barge-in-terminal-absence"}:
+            original_finished.set()
 
     http_server = await asyncio.start_server(http_handler, "127.0.0.1", 0)
     http_port = http_server.sockets[0].getsockname()[1]
@@ -293,11 +363,25 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
         "streaming": {"pipeline_streaming_overlap": True, "jitter_buffer_ms": 50},
     })
     engine = Engine(config)
+    native_direct = engine._maybe_speak_direct_pipeline_tool_result
+    direct_contexts = []
+
+    async def recording_direct(*args, **kwargs):
+        if kwargs.get("tool_name") == "pbx_message_deposit":
+            context = kwargs.get("execution_context")
+            assert context is not None
+            assert context.native_deposit_attempt is not None
+            direct_contexts.append(context)
+        return await native_direct(*args, **kwargs)
+
+    engine._maybe_speak_direct_pipeline_tool_result = recording_direct
     engine.pipeline_orchestrator._started = True
     assert engine.streaming_playback_manager.diag_enable_taps is False
     engine.no_input_watchdog = _Watchdog()
     stt, tts = _ResultSTT(), _RecordingTTS()
     llm = _NoConfirmationInference() if direct_confirmation else _DepositLLM(via_followup=via_followup)
+    if outcome in {"barge-in-pending", "barge-in-terminal-absence"}:
+        llm = _PendingBargeInLLM()
     resolution = _Resolution(stt, llm, tts)
     if direct_confirmation:
         resolution.llm_options = {
@@ -343,7 +427,8 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
         {
             "enabled": True,
             "is_global": False,
-            "url": f"http://127.0.0.1:{http_port}/deposit",
+            "url": (f"http://127.0.0.1:{http_port}/v1/message-deposit"
+                    if direct_confirmation else f"http://127.0.0.1:{http_port}/deposit"),
             "method": "POST",
             "headers": {"Content-Type": "application/json"},
             "body_template": body_template,
@@ -499,6 +584,94 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
     start_index = len(outbound_frames)
     await stt.results.put("Yes.")
     await asyncio.wait_for(request_seen.wait(), timeout=5)
+    tts_before_first_dispatch = list(tts.texts)
+    if outcome == "terminal-tts-correction":
+        guard = engine._pipeline_message_deposit_guard()
+        generation = guard._states[call_id].dispatch_generation
+        await _wait_until(lambda: failure_phrase in tts.texts)
+        await _wait_until(lambda: not engine.streaming_playback_manager.active_streams)
+        assert guard.snapshot(call_id)["phase"] == "awaiting_confirmation"
+        assert requests[0]["message"] == "The sky is blue."
+        await stt.results.put("Change it to the sky is green.")
+        await _wait_until(lambda: "I have: “the sky is green.” Is that right?" in tts.texts)
+        await _wait_until(lambda: not engine.streaming_playback_manager.active_streams)
+        assert len(requests) == 1
+        with pytest.raises(ValueError):
+            guard.consume_confirmed_tool_parameters(call_id, {})
+        await stt.results.put("Yes.")
+        await _wait_until(lambda: len(requests) == 2)
+        assert guard._states[call_id].dispatch_generation > generation
+    if outcome == "terminal-tts-unchanged-retry":
+        guard = engine._pipeline_message_deposit_guard()
+        original_generation = guard._states[call_id].dispatch_generation
+        await _wait_until(lambda: failure_phrase in tts.texts)
+        await _wait_until(lambda: not engine.streaming_playback_manager.active_streams)
+        assert guard.snapshot(call_id)["phase"] == "awaiting_confirmation"
+        assert len(requests) == 1
+        with pytest.raises(ValueError):
+            guard.consume_confirmed_tool_parameters(call_id, {})
+        await stt.results.put("Yes.")
+        await _wait_until(lambda: "I'll make sure Gary gets it." in tts.texts)
+        await _wait_until(lambda: not engine.streaming_playback_manager.active_streams)
+        assert len(requests) == 2
+        assert requests[0] == requests[1]
+        assert guard._states[call_id].dispatch_generation > original_generation
+        with pytest.raises(ValueError):
+            guard.consume_confirmed_tool_parameters(call_id, {})
+        # A separate, explicitly dictated and confirmed request may be a saved
+        # replay. The real worker must retain the existing request identity.
+        await stt.results.put("Leave a message for Gary.")
+        await _wait_until(lambda: guard.snapshot(call_id)["phase"] == "awaiting_message")
+        await _wait_until(lambda: not engine.streaming_playback_manager.active_streams)
+        await stt.results.put("The sky is blue.")
+        await _wait_until(lambda: tts.texts.count(exact_readback) == 2)
+        await _wait_until(lambda: not engine.streaming_playback_manager.active_streams)
+        assert len(requests) == 2
+        with pytest.raises(ValueError):
+            guard.consume_confirmed_tool_parameters(call_id, {})
+        await stt.results.put("Yes.")
+        await _wait_until(lambda: len(requests) == 3)
+    if outcome in {"barge-in-pending", "barge-in-terminal-absence"}:
+        guard = engine._pipeline_message_deposit_guard()
+        original_state = guard._states[call_id]
+        original_envelope = original_state.dispatched_envelope
+        original_generation = original_state.dispatch_generation
+        assert guard.snapshot(call_id)["phase"] == "executing"
+        assert original_envelope is not None
+        # The one-word Yes runs in the real aggregation flush task. This new
+        # final cancels its blocked HTTP read while the native server stays queued.
+        await stt.results.put("Leave a message for Gary.")
+        await _wait_until(lambda: len(reconcile_requests) == 1)
+        await _wait_until(lambda: failure_phrase in tts.texts)
+        await _wait_until(lambda: not engine.streaming_playback_manager.active_streams)
+        assert not original_finished.is_set()
+        assert guard._states[call_id] is original_state
+        assert guard.snapshot(call_id)["phase"] == "reconciling"
+        assert guard.reconciliation_ticket(call_id).envelope_json == original_envelope
+        assert guard.reconciliation_ticket(call_id).generation == original_generation
+        assert requests == reconcile_requests
+        assert requests[0]["message"] == "The sky is blue."
+        with pytest.raises(ValueError):
+            guard.consume_confirmed_tool_parameters(call_id, {})
+        assert llm.calls == 1
+        release_cancelled_http.set()
+        await asyncio.wait_for(original_finished.wait(), timeout=2)
+        await stt.results.put("Did you get that?")
+        if outcome == "barge-in-terminal-absence":
+            await _wait_until(lambda: len(reconcile_requests) == 2)
+            await _wait_until(lambda: guard.snapshot(call_id)["phase"] == "awaiting_confirmation")
+            await _wait_until(lambda: not engine.streaming_playback_manager.active_streams)
+            assert len(requests) == 1
+            assert requests[0] == reconcile_requests[0] == reconcile_requests[1]
+            with pytest.raises(ValueError):
+                guard.consume_confirmed_tool_parameters(call_id, {})
+            await stt.results.put("Change it to the sky is green.")
+            await _wait_until(lambda: "I have: “the sky is green.” Is that right?" in tts.texts)
+            await _wait_until(lambda: not engine.streaming_playback_manager.active_streams)
+            assert len(requests) == 1
+            await stt.results.put("Yes.")
+            await _wait_until(lambda: len(requests) == 2)
+            assert guard._states[call_id].dispatch_generation > original_generation
     if outcome == "cancel":
         await _wait_until(lambda: len(outbound_frames) >= start_index + 3)
         assert engine._pipeline_message_deposit_guard().snapshot(call_id)["phase"] == "executing"
@@ -508,7 +681,8 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
         with caplog.at_level(logging.DEBUG):
             await engine._cleanup_call(call_id)
         assert llm.calls == llm.stream_calls == 0
-        assert http_timeout_totals == [180.0]
+        assert http_timeout_totals[0] == 180.0
+        assert all(0 < total <= 180.0 for total in http_timeout_totals)
         assert len(requests) == 1
         assert engine._pipeline_message_deposit_guard().snapshot(call_id) is None
         assert not engine.streaming_playback_manager._caller_wait_ambience_tasks
@@ -532,10 +706,18 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
         http_server.close()
         await http_server.wait_closed()
         return
-    terminal_phrase = "I'll make sure Gary gets it." if outcome == "success" else failure_phrase
+    terminal_phrase = (
+        "Thanks. I'll make sure they get it." if outcome == "barge-in-pending"
+        else "I'll make sure Gary gets it." if outcome in {"success", "terminal-tts-correction", "terminal-tts-unchanged-retry", "barge-in-terminal-absence"}
+        else failure_phrase
+    )
+    expected_suspensions = [True, False] * (
+        4 if outcome == "barge-in-terminal-absence"
+        else 3 if outcome in {"barge-in-pending", "terminal-tts-unchanged-retry"}
+        else 2 if outcome == "terminal-tts-correction" else 1)
     await _wait_until(lambda: terminal_phrase in tts.texts)
     await _wait_until(lambda: not engine.streaming_playback_manager.active_streams)
-    await _wait_until(lambda: engine.no_input_watchdog.suspensions == [True, False])
+    await _wait_until(lambda: engine.no_input_watchdog.suspensions == expected_suspensions)
     await _wait_until(
         lambda: any(
             stamp >= tts.started_at[-1] and any(payload)
@@ -551,19 +733,49 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
             "urgency": "normal", "confirmed": True,
         })
         assert tool.config.timeout_ms == 180000
-        assert http_timeout_totals == [180.0]
+        assert http_timeout_totals[0] == 180.0
+        assert all(0 < total <= 180.0 for total in http_timeout_totals)
         assert engine._pipeline_message_deposit_guard()._confirmed_execution_window_sec == 5.0
         assert llm.stream_calls == 0
-        assert "Filler must not precede dispatch." not in tts.texts
-    assert requests == [expected_body]
+        assert "Filler must not precede dispatch." not in tts_before_first_dispatch
+    corrected = dict(expected_body, message="the sky is green.")
+    assert requests == ([expected_body, corrected] if outcome in {"terminal-tts-correction", "barge-in-terminal-absence"}
+                        else [expected_body] * 3 if outcome == "terminal-tts-unchanged-retry"
+                        else [expected_body])
+    assert reconcile_requests == [expected_body] * (
+        3 if outcome == "barge-in-terminal-absence"
+        else 2 if outcome in {"barge-in-pending", "terminal-tts-correction", "terminal-tts-unchanged-retry"}
+        else 1 if outcome == "http-failure" else 0)
     assert preflight_requests == ([{}] if via_followup else [])
-    assert llm.calls == (0 if direct_confirmation else 2 if via_followup else 1)
-    assert tts.texts.count(terminal_phrase) == 1
+    assert len(direct_contexts) == (
+        3 if outcome in {"terminal-tts-unchanged-retry", "barge-in-terminal-absence"}
+        else 2 if outcome in {"barge-in-pending", "terminal-tts-correction"} else 1)
+    if outcome == "terminal-tts-correction":
+        assert requests[0]["request_id"] == requests[1]["request_id"] == call_id
+        assert direct_contexts[0].native_deposit_attempt < direct_contexts[1].native_deposit_attempt
+    if outcome == "terminal-tts-unchanged-retry":
+        assert len(native_receipts) == 2
+        assert [receipt["replay"] for receipt in native_receipts] == [False, True]
+        assert {receipt["native_id"] for receipt in native_receipts} == {"fixture-native-artifact"}
+        assert requests == [requests[0]] * 3
+        generations = [context.native_deposit_attempt for context in direct_contexts]
+        assert generations == sorted(set(generations))
+    expected_inferences = (
+        2 if outcome in {"barge-in-pending", "barge-in-terminal-absence"} else 0 if direct_confirmation
+        else 2 if via_followup else 1
+    )
+    assert llm.calls == expected_inferences
+    if outcome == "barge-in-pending":
+        assert all(context.native_deposit_attempt == original_generation
+                   for context in direct_contexts)
+        assert engine._pipeline_message_deposit_guard().snapshot(call_id)["phase"] == "acknowledged"
+    assert tts.texts.count(terminal_phrase) == (2 if outcome == "terminal-tts-unchanged-retry" else 1)
     assert "Never speak this as success." not in tts.texts
-    if outcome != "success":
+    if outcome not in {"success", "barge-in-pending", "terminal-tts-correction", "terminal-tts-unchanged-retry", "barge-in-terminal-absence"}:
         assert "I'll make sure Gary gets it." not in tts.texts
-        assert engine._pipeline_message_deposit_guard().snapshot(call_id)["phase"] == "awaiting_confirmation"
-    assert engine.no_input_watchdog.suspensions == [True, False]
+        expected_phase = "reconciling" if outcome == "http-failure" else "acknowledged"
+        assert engine._pipeline_message_deposit_guard().snapshot(call_id)["phase"] == expected_phase
+    assert engine.no_input_watchdog.suspensions == expected_suspensions
     wait_frames = [
         (stamp, payload)
         for stamp, payload in outbound_frames[start_index:]
@@ -597,15 +809,18 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
     assert not engine.streaming_playback_manager._caller_wait_ambience_tasks
     assert not engine.streaming_playback_manager._caller_wait_ambience_stops
 
-    if outcome == "success":
+    if outcome in {"success", "barge-in-pending", "terminal-tts-correction", "terminal-tts-unchanged-retry", "barge-in-terminal-absence"}:
         await stt.results.put("Yes please.")
     await asyncio.sleep(0.08)
-    assert llm.calls == (0 if direct_confirmation else 2 if via_followup else 1)
-    assert len(requests) == 1
+    assert llm.calls == expected_inferences
+    assert len(requests) == (3 if outcome == "terminal-tts-unchanged-retry"
+                             else 2 if outcome in {"terminal-tts-correction", "barge-in-terminal-absence"} else 1)
 
     caplog.clear()
     with caplog.at_level(logging.DEBUG):
         await engine._cleanup_call(call_id)
+    assert engine._pipeline_message_deposit_guard().snapshot(call_id) is None
+    assert not engine._pipeline_tasks
     assert engine.no_input_watchdog.stopped == [call_id]
     assert hangup_channels == [call_id]
     assert not [record for record in caplog.records if record.exc_info]

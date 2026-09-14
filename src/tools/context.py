@@ -81,6 +81,13 @@ class ToolExecutionContext:
     detected_intent: Optional[str] = None
     confidence: Optional[float] = None
 
+    # Private pipeline transport binding, never tool schema/model arguments.
+    native_deposit_guard: Any = field(default=None, repr=False)
+    native_deposit_attempt: Optional[int] = field(default=None, repr=False)
+    native_deposit_required: bool = field(default=False, repr=False)
+    native_deposit_reconcile: Any = field(default=None, repr=False)
+    native_deposit_rearm: Any = field(default=None, repr=False)
+
     @staticmethod
     def is_pending_attended_transfer(session: Any) -> bool:
         """Return True when an attended transfer is awaiting a callee decision."""

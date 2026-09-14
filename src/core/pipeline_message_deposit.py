@@ -14,7 +14,8 @@ people or extensions.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import json
 import re
 import time
 from typing import Callable, Dict, Iterable, Literal, Mapping, Optional
@@ -192,6 +193,16 @@ class DepositDecision:
     kind: DecisionKind = "pass"
     text: str = ""
 
+@dataclass(frozen=True, repr=False)
+class DepositReconciliation:
+    """Private guard attempt, not an HTTP envelope or model-visible argument."""
+
+    call_id: str
+    generation: int
+    target: str
+    message: str
+    envelope_json: str
+
 
 @dataclass
 class _DepositState:
@@ -201,6 +212,7 @@ class _DepositState:
         "awaiting_confirmation",
         "depositing",
         "executing",
+        "reconciling",
         "acknowledged",
     ]
     target: str
@@ -208,6 +220,10 @@ class _DepositState:
     confirmed_until: float = 0.0
     acknowledged_until: float = 0.0
     dispatch_attempted: bool = False
+    dispatch_generation: int = 0
+    dispatched_envelope: Optional[str] = field(default=None, repr=False)
+    rearm_required: bool = False
+    previous_dispatch: Optional[DepositReconciliation] = field(default=None, repr=False)
 
 
 class PipelineMessageDepositGuard:
@@ -225,6 +241,7 @@ class PipelineMessageDepositGuard:
         if residual_affirmation_window_sec < 0:
             raise ValueError("residual_affirmation_window_sec must be non-negative")
         self._states: Dict[str, _DepositState] = {}
+        self._dispatch_generation = 0
         self._clock = clock
         # The production tool-selection turn has historically completed in about
         # three seconds. Five seconds allows two seconds for bounded event-loop
@@ -245,7 +262,9 @@ class PipelineMessageDepositGuard:
     ) -> DepositDecision:
         """Classify one final caller transcript before it reaches the LLM."""
         if not enabled:
-            self._states.pop(call_id, None)
+            state = self._states.get(call_id)
+            if not state or state.phase not in {"executing", "reconciling"}:
+                self._states.pop(call_id, None)
             return DepositDecision()
 
         text = _collapse_text(transcript)
@@ -253,6 +272,13 @@ class PipelineMessageDepositGuard:
             return DepositDecision(kind="suppress")
         key = _intent_key(text)
         state = self._states.get(call_id)
+
+        if state and state.phase in {"executing", "reconciling"}:
+            # Conversation release is not mutation cancellation. Retain the
+            # private attempt until terminal native proof or call cleanup.
+            if state.phase == "executing" and key in _AFFIRMATIVE:
+                return DepositDecision(kind="suppress")
+            return DepositDecision()
 
         if caller_controls and state:
             # Match a whole command against existing hangup policy, not words
@@ -464,15 +490,6 @@ class PipelineMessageDepositGuard:
             state.confirmed_until = 0.0
             return DepositDecision()
 
-        if state.phase == "executing":
-            if key in _AFFIRMATIVE:
-                return DepositDecision(kind="suppress")
-            if caller_controls:
-                # Releasing conversation does not cancel a dispatched mutation.
-                # Its late result must not recreate a removed guard state.
-                self._states.pop(call_id, None)
-            return DepositDecision()
-
         return DepositDecision()
 
     def consume_confirmed_tool_parameters(
@@ -498,14 +515,66 @@ class PipelineMessageDepositGuard:
             raise ValueError("message_deposit_confirmation_expired")
         state.phase = "executing"
         state.dispatch_attempted = True
+        previous_generation = state.dispatch_generation
+        self._dispatch_generation += 1
+        state.dispatch_generation = self._dispatch_generation
+        if state.rearm_required and state.dispatched_envelope is not None:
+            original = json.loads(state.dispatched_envelope)
+            state.previous_dispatch = DepositReconciliation(
+                call_id, previous_generation,
+                original["target"], original["message"], state.dispatched_envelope,
+            )
+        else:
+            state.previous_dispatch = None
+        state.dispatched_envelope = None
         state.confirmed_until = 0.0
         return {"target": state.target, "message": state.message}
 
-    def note_tool_result(self, call_id: str, *, success: bool) -> None:
+    def note_tool_result(
+        self, call_id: str, *, success: bool, native_outcome: Optional[str] = None,
+        dispatch_generation: Optional[int] = None,
+        native_rearm_required: bool = False,
+    ) -> None:
         """Advance only the matching confirmed deposit after its vetted result."""
         state = self._states.get(call_id)
-        if not state or state.phase != "executing":
+        if not state:
             return
+        if state.dispatched_envelope is not None and (
+            native_outcome is None or dispatch_generation is None
+        ):
+            # A boolean/unbound callback cannot prove the captured native
+            # mutation terminal. Legacy adapters have no captured envelope.
+            return
+        if dispatch_generation is not None and state.dispatch_generation != dispatch_generation:
+            return
+        if state.phase != "executing":
+            # Preserve the accepted post-speech residual-affirmation window.
+            if not (state.phase == "acknowledged" and native_outcome == "verified"):
+                return
+        if state.previous_dispatch is not None:
+            # Failure/cancellation before the fresh absence gate cannot forget
+            # the original native operation in favour of this unspent draft.
+            self.note_rearm_result(
+                state.previous_dispatch, generation=state.dispatch_generation,
+                native_outcome="unknown",
+            )
+            return
+        if native_outcome is not None:
+            if native_outcome == "not_deposited":
+                # A remote terminal failure still needs the native operation's
+                # exact absence grant before reusing its existing request ID.
+                state.phase = "reconciling" if native_rearm_required else "awaiting_confirmation"
+                state.dispatch_attempted = native_rearm_required
+                state.rearm_required = native_rearm_required
+                state.confirmed_until = 0.0
+                state.acknowledged_until = 0.0
+                return
+            if native_outcome != "verified":
+                state.phase = "reconciling"
+                state.confirmed_until = 0.0
+                state.acknowledged_until = 0.0
+                return
+            success = True
         if success:
             state.phase = "acknowledged"
             state.acknowledged_until = (
@@ -514,6 +583,100 @@ class PipelineMessageDepositGuard:
         else:
             state.phase = "awaiting_confirmation"
             state.acknowledged_until = 0.0
+
+    def execution_generation(self, call_id: str) -> Optional[int]:
+        """Return the private generation of the one consumed tool invocation."""
+        state = self._states.get(call_id)
+        return state.dispatch_generation if state and state.phase == "executing" else None
+
+    def rearm_ticket(self, call_id: str, *, generation: int) -> Optional[DepositReconciliation]:
+        """Bind the previous native envelope to this freshly consumed Yes."""
+        state = self._states.get(call_id)
+        return state.previous_dispatch if (
+            state and state.phase == "executing" and state.dispatch_generation == generation
+        ) else None
+
+    def note_rearm_result(
+        self, ticket: DepositReconciliation, *, generation: int, native_outcome: str,
+    ) -> bool:
+        """Apply one exact pre-mutation observation, never dispatch a mutation."""
+        state = self._states.get(ticket.call_id)
+        if (not state or state.phase != "executing" or state.dispatch_generation != generation
+            or state.previous_dispatch != ticket):
+            return False
+        state.previous_dispatch = None
+        if native_outcome == "not_deposited":
+            state.rearm_required = False
+            return True
+        if native_outcome == "verified" and state.dispatched_envelope == ticket.envelope_json:
+            state.phase = "acknowledged"
+            state.rearm_required = False
+            state.acknowledged_until = self._clock() + self._residual_affirmation_window_sec
+            return True
+        state.phase = "reconciling"
+        state.target, state.message = ticket.target, ticket.message
+        state.dispatched_envelope = ticket.envelope_json
+        state.rearm_required = True
+        state.confirmed_until = state.acknowledged_until = 0.0
+        return False
+
+    def capture_dispatch_envelope(
+        self, call_id: str, envelope: Mapping[str, object], *, generation: int,
+    ) -> None:
+        """Capture the closed server-bound request before HTTP dispatch, no auth."""
+        state = self._states.get(call_id)
+        if not state or state.phase != "executing" or state.dispatch_generation != generation:
+            raise ValueError("message_deposit_stale_dispatch")
+        fields = {
+            "call_id", "request_id", "target", "message", "confirmed",
+            "caller_name", "callback_number", "urgency",
+        }
+        if not isinstance(envelope, Mapping) or set(envelope) - fields or (
+            envelope.get("call_id") != call_id or envelope.get("confirmed") is not True
+            or envelope.get("target") != state.target or envelope.get("message") != state.message
+            or not isinstance(envelope.get("request_id"), str) or not envelope["request_id"]
+            or any(envelope.get(key) is not None and not isinstance(envelope[key], str)
+                   for key in ("caller_name", "callback_number", "urgency"))
+        ):
+            raise ValueError("message_deposit_invalid_dispatch_envelope")
+        encoded = json.dumps(dict(envelope), sort_keys=True, separators=(",", ":"))
+        if state.dispatched_envelope is not None and state.dispatched_envelope != encoded:
+            raise ValueError("message_deposit_dispatch_envelope_changed")
+        state.dispatched_envelope = encoded
+
+    def reconciliation_ticket(self, call_id: str) -> Optional[DepositReconciliation]:
+        """Bind one future read-only result to the existing unresolved attempt."""
+        state = self._states.get(call_id)
+        if not state or state.phase != "reconciling" or state.dispatched_envelope is None:
+            return None
+        return DepositReconciliation(
+            call_id, state.dispatch_generation, state.target, state.message,
+            state.dispatched_envelope,
+        )
+
+    def note_reconciliation_result(
+        self, ticket: DepositReconciliation, *, native_outcome: str,
+    ) -> bool:
+        """Apply native proof only; the managed read-only HTTP carrier owns IO."""
+        state = self._states.get(ticket.call_id)
+        if not state or state.phase != "reconciling" or (
+            state.dispatch_generation != ticket.generation
+            or state.target != ticket.target or state.message != ticket.message
+            or state.dispatched_envelope != ticket.envelope_json
+        ):
+            return False
+        if native_outcome == "verified":
+            state.phase = "acknowledged"
+            state.acknowledged_until = self._clock() + self._residual_affirmation_window_sec
+        elif native_outcome == "not_deposited":
+            # Absence is not caller consent. Corrections still get exact readback.
+            state.phase = "awaiting_confirmation"
+            state.dispatch_attempted = False
+            state.rearm_required = True
+        else:
+            return False
+        state.confirmed_until = 0.0
+        return True
 
     def cleanup(self, call_id: str) -> None:
         """Discard all caller text when the call ends."""

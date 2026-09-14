@@ -7319,8 +7319,21 @@ class Engine:
         result: Dict[str, Any],
         *,
         tool_name: Optional[str] = None,
+        execution_context: Optional[Any] = None,
     ) -> bool:
         """Speak one tool-vetted phrase and skip the second LLM continuation."""
+        native_deposit = result.get("_native_deposit")
+        native_outcome = None
+        if tool_name == "pbx_message_deposit" and isinstance(native_deposit, dict):
+            native_outcome = native_deposit.get("outcome") or "unknown"
+            # Adopt the native result before speech/store awaits can fail or cancel.
+            self._pipeline_message_deposit_guard().note_tool_result(
+                call_id,
+                success=normalize_tool_terminal_status(result) == "success",
+                native_outcome=native_outcome,
+                dispatch_generation=getattr(execution_context, "native_deposit_attempt", None),
+                native_rearm_required=native_deposit.get("rearm_required") is True,
+            )
         direct_text = result.get("_direct_response_text")
         if not isinstance(direct_text, str):
             return False
@@ -7363,10 +7376,14 @@ class Engine:
                     "Direct pipeline tool response interrupted",
                     call_id=call_id,
                 )
-            if tool_name == "pbx_message_deposit":
+            if tool_name == "pbx_message_deposit" and (
+                native_outcome is None or native_outcome == "verified"
+            ):
                 self._pipeline_message_deposit_guard().note_tool_result(
                     call_id,
                     success=normalize_tool_terminal_status(result) == "success",
+                    native_outcome=native_outcome,
+                    dispatch_generation=getattr(execution_context, "native_deposit_attempt", None),
                 )
             return True
 
@@ -7391,10 +7408,14 @@ class Engine:
                     pid,
                     timeout_sec=(duration_sec + 3.0),
                 )
-        if tool_name == "pbx_message_deposit":
+        if tool_name == "pbx_message_deposit" and (
+            native_outcome is None or native_outcome == "verified"
+        ):
             self._pipeline_message_deposit_guard().note_tool_result(
                 call_id,
                 success=normalize_tool_terminal_status(result) == "success",
+                native_outcome=native_outcome,
+                dispatch_generation=getattr(execution_context, "native_deposit_attempt", None),
             )
         return True
 
@@ -16666,11 +16687,29 @@ class Engine:
                                 if tool:
                                     canonical_tool = tool_registry.canonicalize_tool_name(name)
                                     if canonical_tool == "pbx_message_deposit":
-                                        args = self._bind_pipeline_tool_parameters(
-                                            call_id,
-                                            canonical_tool,
-                                            args,
+                                        tool_ctx.native_deposit_guard = self._pipeline_message_deposit_guard()
+                                        tool_ctx.native_deposit_rearm = None
+                                        tool_ctx.native_deposit_required = message_caller_controls
+                                        tool_ctx.native_deposit_reconcile = (
+                                            tool_ctx.native_deposit_guard.reconciliation_ticket(call_id)
                                         )
+                                        if tool_ctx.native_deposit_reconcile is not None:
+                                            # Uncertain prior mutation: only its exact private
+                                            # envelope may be read back, never new model words.
+                                            args = {}
+                                            tool_ctx.native_deposit_attempt = (
+                                                tool_ctx.native_deposit_reconcile.generation
+                                            )
+                                        else:
+                                            args = self._bind_pipeline_tool_parameters(
+                                                call_id, canonical_tool, args,
+                                            )
+                                            tool_ctx.native_deposit_attempt = (
+                                                tool_ctx.native_deposit_guard.execution_generation(call_id)
+                                            )
+                                            tool_ctx.native_deposit_rearm = tool_ctx.native_deposit_guard.rearm_ticket(
+                                                call_id, generation=tool_ctx.native_deposit_attempt,
+                                            )
                                         tool_call["parameters"] = dict(args)
                                     logger.info("Executing pipeline tool", tool=name, call_id=call_id)
                                     # Slow-response UX (pipeline only): speak a waiting message if the tool takes too long.
@@ -16830,6 +16869,7 @@ class Engine:
                                             conversation_history,
                                             result,
                                             tool_name=canonical_tool,
+                                            execution_context=tool_ctx,
                                         ):
                                             # The HTTP tool explicitly selected one vetted
                                             # caller-facing phrase. Do not ask the LLM to
@@ -16962,11 +17002,27 @@ class Engine:
                                                         next_tool = tool_registry.get(next_name)
                                                         if next_tool:
                                                             if next_canonical_name == "pbx_message_deposit":
-                                                                next_args = self._bind_pipeline_tool_parameters(
-                                                                    call_id,
-                                                                    next_canonical_name,
-                                                                    next_args,
+                                                                tool_ctx.native_deposit_guard = self._pipeline_message_deposit_guard()
+                                                                tool_ctx.native_deposit_rearm = None
+                                                                tool_ctx.native_deposit_required = message_caller_controls
+                                                                tool_ctx.native_deposit_reconcile = (
+                                                                    tool_ctx.native_deposit_guard.reconciliation_ticket(call_id)
                                                                 )
+                                                                if tool_ctx.native_deposit_reconcile is not None:
+                                                                    next_args = {}
+                                                                    tool_ctx.native_deposit_attempt = (
+                                                                        tool_ctx.native_deposit_reconcile.generation
+                                                                    )
+                                                                else:
+                                                                    next_args = self._bind_pipeline_tool_parameters(
+                                                                        call_id, next_canonical_name, next_args,
+                                                                    )
+                                                                    tool_ctx.native_deposit_attempt = (
+                                                                        tool_ctx.native_deposit_guard.execution_generation(call_id)
+                                                                    )
+                                                                    tool_ctx.native_deposit_rearm = tool_ctx.native_deposit_guard.rearm_ticket(
+                                                                        call_id, generation=tool_ctx.native_deposit_attempt,
+                                                                    )
                                                                 next_tc["parameters"] = dict(next_args)
                                                             logger.info("Executing follow-up tool", tool=next_name, call_id=call_id)
                                                             next_tool_start = time.time()
@@ -17158,6 +17214,7 @@ class Engine:
                                                                 conversation_history,
                                                                 next_result,
                                                                 tool_name=next_canonical_name,
+                                                                execution_context=tool_ctx,
                                                             ):
                                                                 return
                                                         else:
