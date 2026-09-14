@@ -17,7 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 import time
-from typing import Callable, Dict, Literal, Mapping, Optional
+from typing import Callable, Dict, Iterable, Literal, Mapping, Optional
 
 
 _MAX_TARGET_CHARS = 120
@@ -110,6 +110,12 @@ _PRE_MESSAGE_ACKNOWLEDGEMENT = {
     "thanks",
     "thank you",
 }
+_MESSAGE_META_REQUESTS = {
+    "change the message", "change message", "can i change the message",
+    "can we change the message", "i want to change the message",
+    "try again", "can i try again", "can we try again", "lets try again",
+    "start again", "can we start again", "start over", "can we start over",
+}
 
 
 def _collapse_text(value: str) -> str:
@@ -201,6 +207,7 @@ class _DepositState:
     message: str = ""
     confirmed_until: float = 0.0
     acknowledged_until: float = 0.0
+    dispatch_attempted: bool = False
 
 
 class PipelineMessageDepositGuard:
@@ -233,6 +240,8 @@ class PipelineMessageDepositGuard:
         *,
         enabled: bool,
         default_target: Optional[str] = None,
+        caller_controls: bool = False,
+        caller_end_markers: Iterable[str] = (),
     ) -> DepositDecision:
         """Classify one final caller transcript before it reaches the LLM."""
         if not enabled:
@@ -244,6 +253,37 @@ class PipelineMessageDepositGuard:
             return DepositDecision(kind="suppress")
         key = _intent_key(text)
         state = self._states.get(call_id)
+
+        if caller_controls and state:
+            # Match a whole command against existing hangup policy, not words
+            # embedded in the caller's literal message. Courtesy is not exit.
+            end_keys = {_intent_key(marker) for marker in caller_end_markers}
+            if key in end_keys and key not in (
+                _PRE_MESSAGE_ACKNOWLEDGEMENT | _AFFIRMATIVE | _NEGATIVE
+            ):
+                self._states.pop(call_id, None)
+                return DepositDecision()
+            if key in _CANCEL and state.phase in {"depositing", "executing"}:
+                self._states.pop(call_id, None)
+                # Dispatched work cannot be pronounced undone by this guard.
+                return DepositDecision() if state.dispatch_attempted else DepositDecision(
+                    kind="speak", text="Of course."
+                )
+            if key in _MESSAGE_META_REQUESTS and state.phase != "acknowledged":
+                if state.dispatch_attempted:
+                    # An edit/retry request is not permission to replay a
+                    # possibly dispatched mutation. Native agent reconciles.
+                    self._states.pop(call_id, None)
+                    return DepositDecision()
+                state.message = ""
+                state.confirmed_until = 0.0
+                state.phase = "awaiting_message" if state.target else "awaiting_target"
+                return DepositDecision(
+                    kind="speak",
+                    text=("All right. What would you like me to say instead?"
+                          if state.target else
+                          "Who would you like me to leave the message for?"),
+                )
 
         configured_target = _collapse_text(default_target or "")
         if len(configured_target) > _MAX_TARGET_CHARS:
@@ -395,7 +435,14 @@ class PipelineMessageDepositGuard:
             correction = _message_correction(text)
             if correction:
                 state.message = correction
+                state.confirmed_until = 0.0
                 return DepositDecision(kind="speak", text=_quoted_readback(correction))
+            if caller_controls:
+                # An unrelated caller turn is conversation, not another demand
+                # for confirmation. Discard the draft so a later Yes cannot
+                # authorize the former payload.
+                self._states.pop(call_id, None)
+                return DepositDecision()
             return DepositDecision(
                 kind="speak",
                 text="Was that right? You can say yes, or tell me what to change.",
@@ -407,6 +454,9 @@ class PipelineMessageDepositGuard:
             # the state acknowledged or failed.
             if key in _AFFIRMATIVE:
                 return DepositDecision(kind="suppress")
+            if caller_controls:
+                self._states.pop(call_id, None)
+                return DepositDecision()
             # A new substantive caller turn revokes the unspent confirmation.
             # The utterance still reaches the ordinary dialog model, but a tool
             # call from that turn cannot consume the former authorization.
@@ -417,6 +467,10 @@ class PipelineMessageDepositGuard:
         if state.phase == "executing":
             if key in _AFFIRMATIVE:
                 return DepositDecision(kind="suppress")
+            if caller_controls:
+                # Releasing conversation does not cancel a dispatched mutation.
+                # Its late result must not recreate a removed guard state.
+                self._states.pop(call_id, None)
             return DepositDecision()
 
         return DepositDecision()
@@ -443,6 +497,7 @@ class PipelineMessageDepositGuard:
             state.confirmed_until = 0.0
             raise ValueError("message_deposit_confirmation_expired")
         state.phase = "executing"
+        state.dispatch_attempted = True
         state.confirmed_until = 0.0
         return {"target": state.target, "message": state.message}
 

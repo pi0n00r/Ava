@@ -15848,12 +15848,23 @@ class Engine:
                         str(name)
                         for name in ((llm_options or {}).get("tools") or [])
                     }
+                    message_caller_controls = (
+                        (llm_options or {}).get("call_id_header_enabled") is True
+                        and (llm_options or {}).get("session_user_from_call_id") is True
+                    )
                     deposit_decision = self._pipeline_message_deposit_guard().decide(
                         call_id,
                         transcript_text,
                         enabled="pbx_message_deposit" in configured_tool_names,
                         default_target=(llm_options or {}).get(
                             "message_deposit_default_target"
+                        ),
+                        caller_controls=message_caller_controls,
+                        caller_end_markers=(
+                            (resolve_hangup_policy(
+                                getattr(self.config, "tools", None)
+                            ).get("markers") or {}).get("end_call", [])
+                            if message_caller_controls else ()
                         ),
                     )
                     if deposit_decision.kind == "suppress":
