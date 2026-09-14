@@ -89,6 +89,98 @@ class TransactionTests(unittest.TestCase):
         result=deploy.check(self.native,self.root,self.candidate)
         self.assertEqual(result["logical_agent_config"],self.native.logical)
         self.assertNotIn("stop",self.native.events);self.assertFalse(self.backups.exists())
+    def install_candidate(self):
+        for name in deploy.TARGETS:
+            body=(self.candidate/name).read_bytes()
+            (self.root/name).write_bytes(body);(self.root/name).chmod(0o644)
+    def test_installed_verify_accepts_after_and_is_nonactuating(self):
+        self.install_candidate()
+        result=deploy.verify_installed(self.native,self.root)
+        self.assertEqual({n:deploy.stable(v) for n,v in result["installed"].items()},self.after)
+        self.assertEqual(result["logical_agent_config"],self.native.logical)
+        self.assertNotIn("stop",self.native.events);self.assertNotIn("start",self.native.events)
+        self.assertFalse(self.backups.exists())
+    def test_check_only_retains_before_state_semantics(self):
+        self.install_candidate()
+        with self.assertRaisesRegex(deploy.Blocked,"live_preimage_mismatch"):
+            deploy.check(self.native,self.root,self.candidate)
+        self.assertNotIn("stop",self.native.events);self.assertNotIn("start",self.native.events)
+    def test_installed_verify_rejects_before_and_unknown(self):
+        with self.assertRaisesRegex(deploy.Blocked,"installed_runtime_state_mismatch"):
+            deploy.verify_installed(self.native,self.root)
+        self.install_candidate();(self.root/deploy.TARGETS[0]).write_bytes(b"UNKNOWN=True\n")
+        with self.assertRaisesRegex(deploy.Blocked,"installed_runtime_state_mismatch"):
+            deploy.verify_installed(self.native,self.root)
+    def test_installed_verify_rejects_mixed_state(self):
+        second="core/fixture_second.py"
+        (self.root/second).write_bytes(b"SECOND_OLD=True\n");(self.root/second).chmod(0o644)
+        (self.candidate/second).write_bytes(b"SECOND_NEW=True\n");(self.candidate/second).chmod(0o644)
+        targets=deploy.TARGETS+(second,)
+        after={**self.after,second:deploy.stable(deploy.fingerprint(self.candidate/second))}
+        with mock.patch.object(deploy,"TARGETS",targets),mock.patch.object(deploy,"AFTER",after):
+            self.install_candidate()
+            (self.root/second).write_bytes(b"SECOND_OLD=True\n")
+            with self.assertRaisesRegex(deploy.Blocked,"installed_runtime_state_mismatch"):
+                deploy.verify_installed(self.native,self.root)
+    def test_installed_verify_rejects_health_ari_and_activity(self):
+        for field,value,error in (("ari",False,"health_or_ari_not_ready"),
+                                  ("active_calls",1,"quiescence_unavailable_or_active"),
+                                  ("active_sessions",1,"quiescence_unavailable_or_active"),
+                                  ("asterisk_channels",1,"quiescence_unavailable_or_active")):
+            with self.subTest(field=field):
+                self.native=FakeNative(self.root);self.install_candidate()
+                if field=="ari":self.native.ari=value
+                else:self.native.counts[field]=value
+                with self.assertRaisesRegex(deploy.Blocked,error):
+                    deploy.verify_installed(self.native,self.root)
+    def test_installed_verify_rejects_native_pbx_activity(self):
+        self.install_candidate();self.native.channels=1
+        with self.assertRaisesRegex(deploy.Blocked,"native_pbx_zero_unavailable_or_active"):
+            deploy.verify_installed(self.native,self.root)
+    def test_installed_verify_rejects_config_and_logical_drift(self):
+        for path in deploy.PROTECTED_PATHS:
+            with self.subTest(path=path):
+                self.native=FakeNative(self.root);self.install_candidate()
+                original=self.native.configuration;calls=0
+                def changed_config(*args,**kwargs):
+                    nonlocal calls
+                    calls+=1
+                    value=original(*args,**kwargs)
+                    if calls==2:
+                        value=copy.deepcopy(value)
+                        value[path]={**value[path],"sha256":"b"*64}
+                    return value
+                with mock.patch.object(self.native,"configuration",side_effect=changed_config):
+                    with self.assertRaisesRegex(deploy.Blocked,"installed_protected_config_changed"):
+                        deploy.verify_installed(self.native,self.root)
+        self.native=FakeNative(self.root);calls=0
+        def changed_logical(*args,**kwargs):
+            nonlocal calls
+            calls+=1;value=copy.deepcopy(self.native.logical)
+            if calls==2:value["sha256"]="b"*64
+            return value
+        with mock.patch.object(self.native,"agent_snapshot",side_effect=changed_logical):
+            with self.assertRaisesRegex(deploy.Blocked,"installed_logical_config_changed"):
+                deploy.verify_installed(self.native,self.root)
+    def test_installed_verify_rejects_config_hash_and_physical_drift(self):
+        self.install_candidate();health_calls=0
+        def changed_health():
+            nonlocal health_calls
+            health_calls+=1
+            return {"status":"healthy","ari_connected":True,
+                    "config_hash":"config-b" if health_calls==2 else "config-a",**self.native.counts}
+        with mock.patch.object(self.native,"health",side_effect=changed_health):
+            with self.assertRaisesRegex(deploy.Blocked,"installed_config_hash_changed"):
+                deploy.verify_installed(self.native,self.root)
+        self.native=FakeNative(self.root);inspect_calls=0
+        def changed_inspect():
+            nonlocal inspect_calls
+            inspect_calls+=1
+            return {"id":self.native.container_id,"image":deploy.IMAGE,"running":True,
+                    "mounts_sha256":("n" if inspect_calls==2 else "m")*64}
+        with mock.patch.object(self.native,"inspect",side_effect=changed_inspect):
+            with self.assertRaisesRegex(deploy.Blocked,"container_identity_changed"):
+                deploy.verify_installed(self.native,self.root)
     def test_one_guard_apply_rollback_and_evidence_separation(self):
         config=self.native.configuration();database=self.native.database
         backup,receipt=self.apply()
@@ -431,6 +523,15 @@ class TransactionTests(unittest.TestCase):
         with mock.patch.object(deploy,"COMMIT","a"*40),mock.patch.object(deploy,"SOURCE_TREE","b"*40),mock.patch.object(deploy,"check",return_value=checked),mock.patch.object(deploy,"with_lock") as lock:
             with mock.patch("builtins.print"):self.assertEqual(deploy.main(["--check-only"]),0)
         lock.assert_not_called()
+    def test_installed_verify_cli_never_uses_lock(self):
+        verified={"health":self.native.health(),"logical_agent_config":self.native.logical,
+                  "configuration":self.native.configuration(),"installed":self.after}
+        with mock.patch.object(deploy,"COMMIT","a"*40),mock.patch.object(deploy,"SOURCE_TREE","b"*40),mock.patch.object(deploy,"verify_installed",return_value=verified),mock.patch.object(deploy,"with_lock") as lock:
+            with mock.patch("builtins.print") as output:
+                self.assertEqual(deploy.main(["--verify-installed"]),0)
+        lock.assert_not_called()
+        envelope=json.loads(output.call_args.args[0])
+        self.assertEqual(envelope["status"],"installed_verify_pass")
     def test_unbound_cli_cannot_inspect_or_mutate(self):
         with mock.patch.object(deploy,"COMMIT",None),mock.patch.object(deploy,"Native") as native:
             with mock.patch("builtins.print"):self.assertEqual(deploy.main(["--check-only"]),1)

@@ -353,6 +353,31 @@ def check(native,root=LIVE_ROOT,candidate=CANDIDATE_ROOT):
     return {"before":before,"anchor":anchor,"health":health,
             "logical_agent_config":logical,"configuration":configuration,"sources":sources}
 
+def verify_installed(native,root=LIVE_ROOT):
+    installed = identities(root)
+    if any(stable(installed[name]) != AFTER[name] for name in TARGETS):
+        raise Blocked("installed_runtime_state_mismatch")
+    anchor = require_container(native,running=True)
+    native.installed_syntax()
+    health = native.health(); require_zero(health); require_pbx(native)
+    if not isinstance(health.get("config_hash"),str) or not health["config_hash"]:
+        raise Blocked("installed_config_hash_unavailable")
+    logical = native.agent_snapshot()
+    configuration = native.configuration()
+    native.runtime_files(installed)
+    final_health = native.health(); require_zero(final_health); require_pbx(native)
+    if final_health.get("config_hash") != health["config_hash"]:
+        raise Blocked("installed_config_hash_changed")
+    if identities(root) != installed:
+        raise Blocked("installed_runtime_changed_during_verify")
+    if native.configuration() != configuration:
+        raise Blocked("installed_protected_config_changed")
+    if native.agent_snapshot() != logical:
+        raise Blocked("installed_logical_config_changed")
+    require_container(native,anchor,running=True)
+    return {"installed":installed,"anchor":anchor,"health":final_health,
+            "logical_agent_config":logical,"configuration":configuration}
+
 def target_state(identity,row):
     if identity == row["before"]: return "before"
     for key in ("postimage","prepared","restored","restore_prepared"):
@@ -597,6 +622,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     modes = parser.add_mutually_exclusive_group(required=True)
     modes.add_argument("--check-only",action="store_true")
+    modes.add_argument("--verify-installed",action="store_true")
     modes.add_argument("--apply",action="store_true")
     modes.add_argument("--rollback",type=Path)
     parser.add_argument("--backup",type=Path,help="exclusive new backup directory for --apply")
@@ -612,6 +638,12 @@ def main(argv=None):
             result = {"status":"check_only_pass","health":checked["health"],
                       "logical_agent_config":checked["logical_agent_config"],
                       "configuration":checked["configuration"]}
+        elif args.verify_installed:
+            verified = verify_installed(native)
+            result = {"status":"installed_verify_pass","health":verified["health"],
+                      "logical_agent_config":verified["logical_agent_config"],
+                      "configuration":verified["configuration"],
+                      "installed":verified["installed"]}
         else:
             def operation():
                 if args.apply:
