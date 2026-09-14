@@ -533,6 +533,15 @@ class NativeContractTests(unittest.TestCase):
         with mock.patch.object(deploy.Native,"run",return_value=b"") as run:
             deploy.Native().syntax("core/pipeline_message_deposit.py",b"OK=True\n")
         self.assertIn("core/pipeline_message_deposit.py",run.call_args.args[0][-1])
+    def test_mutating_container_commands_have_no_outer_timeout_or_retry(self):
+        with mock.patch.object(deploy.Native,"run",return_value=b"") as run:
+            native=deploy.Native();native.stop();native.start()
+        self.assertEqual(run.call_count,2)
+        self.assertEqual(run.call_args_list[0].args[0],
+            ["docker","stop","--time","30","ai_engine"])
+        self.assertEqual(run.call_args_list[0].kwargs["timeout"],None)
+        self.assertEqual(run.call_args_list[1].args[0],["docker","start","ai_engine"])
+        self.assertEqual(run.call_args_list[1].kwargs["timeout"],None)
     def test_native_ari_authenticated_get_and_explicit_shape(self):
         response={"authenticated":True,"operation":"GET /ari/channels","channels":0}
         with mock.patch.object(deploy.Native,"run",return_value=json.dumps(response).encode()) as run:

@@ -229,10 +229,16 @@ print(json.dumps(result,sort_keys=True))"""
         return protected_configuration(LIVE_ROOT.parent,include_capture)
 
     def stop(self):
-        self.run(["docker", "stop", "--time", "30", "ai_engine"], "container_stop")
+        # Docker owns the bounded 30-second stop grace period. Do not add an
+        # outer client timeout: an ambiguous client timeout must never trigger
+        # a second mutating command while the daemon may still be completing it.
+        self.run(["docker", "stop", "--time", "30", "ai_engine"],
+                 "container_stop", timeout=None)
 
     def start(self):
-        self.run(["docker", "start", "ai_engine"], "container_start")
+        # Likewise, wait for the one requested start to return. Read-only
+        # health and identity probes remain independently bounded.
+        self.run(["docker", "start", "ai_engine"], "container_start", timeout=None)
 
     def agent_snapshot(self, include_backup=False):
         code = r'''import base64,hashlib,json,sqlite3,tempfile,os
