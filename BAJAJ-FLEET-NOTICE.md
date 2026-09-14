@@ -2,6 +2,7 @@
 AI-NOTICE:Schema-Version=0.1
 AI-NOTICE:License=AGPL-3.0-or-later
 AI-NOTICE:Project=Ava
+AI-NOTICE:Repository=https://github.com/pi0n00r/Ava
 AI-NOTICE:Scope=Fleet-authored changes; upstream MIT material retains its notices
 -->
 
@@ -12,6 +13,13 @@ This repository is the maintained Bajaj fleet fork of Ava. The supplied upstream
 tests, deployment helpers, and documentation are AGPL-3.0-or-later under their
 AI-NOTICE headers and `LICENSE-AGPL-3.0.txt`. These notices supplement rather
 than replace the upstream MIT licence.
+
+This is an independent fork derived from the upstream
+[`hkjarral/AVA-AI-Voice-Agent-for-Asterisk`](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk)
+source. It is not associated with, endorsed by, sponsored by, or officially
+affiliated with the upstream project or its authors. References and links to
+the upstream project are retained for factual attribution and do not imply an
+official relationship.
 
 The initial Git history was reconstructed from the exact supplied live-root
 capture because the corresponding upstream commit history was unavailable.

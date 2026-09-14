@@ -1,3 +1,11 @@
+<!--
+AI-NOTICE:Schema-Version=0.1
+AI-NOTICE:License=AGPL-3.0-or-later
+AI-NOTICE:Project=Ava
+AI-NOTICE:Repository=https://github.com/pi0n00r/Ava
+AI-NOTICE:Scope=Fleet-authored fork notice; retained upstream documentation remains MIT
+-->
+
 <div align="center">
 
 <picture>
@@ -7,7 +15,7 @@
 </picture>
 
 ![Version](https://img.shields.io/badge/version-7.5.4-blue.svg)
-![License](https://img.shields.io/badge/license-MIT-green.svg)
+![License](https://img.shields.io/badge/license-MIT%20upstream%20%7C%20AGPL--3.0%2B%20fleet-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.11+-blue.svg)
 ![Docker](https://img.shields.io/badge/docker-compose-blue.svg)
 ![Asterisk](https://img.shields.io/badge/asterisk-18+-orange.svg)
@@ -21,6 +29,21 @@ The most powerful, flexible open-source AI voice agent for Asterisk/FreePBX. Fea
 [Quick Start](#-quick-start) • [Features](#-features) • [Roadmap](docs/ROADMAP.md) • [Demo](#-demo) • [Docs](docs/README.md) • [Community](#-community)
 
 </div>
+
+---
+
+## Independent maintained fork
+
+This repository is an independent Bajaj fleet fork derived from the upstream
+[AVA AI Voice Agent for Asterisk](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk)
+MIT-licensed source. It is not associated with, endorsed by, sponsored by, or
+officially affiliated with the upstream project or its authors.
+
+The upstream README is retained below for attribution and technical context.
+Its badges, community, issue, discussion, and sponsorship links refer to the
+upstream project. Fleet-authored changes are identified separately in
+[BAJAJ-FLEET-NOTICE.md](BAJAJ-FLEET-NOTICE.md) and are licensed under
+AGPL-3.0-or-later as declared there.
 
 ---
 
@@ -1133,7 +1156,12 @@ See [CONTRIBUTORS.md](CONTRIBUTORS.md) for the full list — contributions are r
 
 ## 📝 License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+The retained upstream source is licensed under the MIT License; see
+[LICENSE](LICENSE). Fleet-authored additions are licensed under
+AGPL-3.0-or-later; see [BAJAJ-FLEET-NOTICE.md](BAJAJ-FLEET-NOTICE.md) and
+[LICENSE-AGPL-3.0.txt](LICENSE-AGPL-3.0.txt). The fork is independent and is not
+associated with, endorsed by, sponsored by, or officially affiliated with the
+upstream project or its authors.
 
 ---
 
