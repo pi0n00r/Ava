@@ -261,6 +261,30 @@ def test_optional_structured_default_target_skips_only_the_recipient_question():
     }
 
 
+def test_observed_truncated_request_is_exact_and_does_not_broaden_message_intent():
+    guard = PipelineMessageDepositGuard()
+
+    observed = guard.decide(
+        "call-observed-asr",
+        "elect to leave a message.",
+        enabled=True,
+        default_target="Gary",
+    )
+    assert observed.text == "Of course. What would you like me to tell Gary?"
+    assert guard.snapshot("call-observed-asr") == {
+        "phase": "awaiting_message",
+        "has_target": True,
+        "has_message": False,
+    }
+
+    for value in (
+        "elect to leave this message",
+        "select a message",
+        "message recorded",
+    ):
+        assert guard.decide(f"near-miss-{value}", value, enabled=True).kind == "pass"
+
+
 def test_targetless_intent_without_default_asks_for_recipient_first():
     guard = PipelineMessageDepositGuard()
 

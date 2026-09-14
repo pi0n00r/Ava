@@ -36,6 +36,12 @@ _MESSAGE_REQUEST_WITHOUT_TARGET_RE = re.compile(
     r"(?:\s+please)?[.!?]*$",
     re.IGNORECASE,
 )
+# Recover one observed initial-phoneme loss from an ordinary
+# "I'd like to leave a message" request. Keep this exact so an ASR fragment
+# does not turn unrelated mentions of messages into dictation state.
+_OBSERVED_TRUNCATED_MESSAGE_REQUESTS = frozenset({
+    "elect to leave a message",
+})
 _REFERENCED_MESSAGE_REQUEST_RE = re.compile(
     r"(?:^|\b)(?:i(?:'d| would) like to\s+|i want to\s+|can i\s+|could i\s+)?"
     r"(?:leave|give|take)\s+(?:that|the\s+(?:last|previous))\s+message\s+"
@@ -164,7 +170,10 @@ def _referenced_message_request_target(value: str) -> Optional[str]:
 
 
 def _is_message_request_without_target(value: str) -> bool:
-    return bool(_MESSAGE_REQUEST_WITHOUT_TARGET_RE.fullmatch(_collapse_text(value)))
+    text = _collapse_text(value)
+    return bool(_MESSAGE_REQUEST_WITHOUT_TARGET_RE.fullmatch(text)) or (
+        _intent_key(text) in _OBSERVED_TRUNCATED_MESSAGE_REQUESTS
+    )
 
 
 def _message_correction(value: str) -> Optional[str]:

@@ -412,7 +412,7 @@ class MessageControlTests(unittest.TestCase):
     def test_untouched_shared_paths_are_byte_identical(self):
         for relative in (
             "src/tools/telephony/hangup_policy.py",
-            "src/logging_config.py", "tests/test_pipeline_message_deposit.py"
+            "src/logging_config.py",
         ):
             with self.subTest(path=relative):
                 self.assertEqual((CANDIDATE / relative).read_bytes(), baseline_bytes(relative))

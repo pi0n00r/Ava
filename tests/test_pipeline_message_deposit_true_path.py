@@ -228,6 +228,7 @@ async def _wait_until(predicate, timeout=3.0):
         (False, False, "success"),
         (True, False, "success"),
         (False, True, "success"),
+        (False, True, "observed-truncated-request"),
         (False, True, "cancel"),
         (False, True, "http-failure"),
         (False, True, "missing-spoken-response"),
@@ -240,6 +241,7 @@ async def _wait_until(predicate, timeout=3.0):
     ],
     ids=[
         "legacy-primary", "legacy-followup", "main-direct-confirmation",
+        "main-observed-truncated-request",
         "main-pending-cancel", "main-http-failure", "main-invalid-direct-result",
         "main-barge-in-pending",
         "main-terminal-tts-correction",
@@ -404,6 +406,7 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
     assert engine.streaming_playback_manager.diag_enable_taps is False
     engine.no_input_watchdog = _Watchdog()
     stt, tts = _ResultSTT(), _RecordingTTS()
+    observed_truncated_request = outcome == "observed-truncated-request"
     prior_reference = outcome.startswith("prior-reference-")
     if prior_reference:
         llm = _PriorReferenceLLM(streaming=outcome.endswith("-streaming"))
@@ -419,6 +422,8 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
             "session_user_from_call_id": True,
             "call_id_header_enabled": True,
         }
+        if observed_truncated_request:
+            resolution.llm_options["message_deposit_default_target"] = "Gary"
         engine._pipeline_message_deposit_guard_state = PipelineMessageDepositGuard(clock=lambda: guard_time[0])
         engine.config.streaming.pipeline_filler_enabled = True
         engine.config.streaming.pipeline_filler_phrases = ["Filler must not precede dispatch."]
@@ -591,36 +596,55 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
         await _wait_until(lambda: not engine.streaming_playback_manager.active_streams)
         assert requests == []
     else:
-        request_text = (
-            "I'd like to leave a message."
-            if direct_confirmation
-            else "I'd like to leave a message for Gary, please."
-        )
+        if observed_truncated_request:
+            request_text = "elect to leave a message."
+        elif direct_confirmation:
+            request_text = "I'd like to leave a message."
+        else:
+            request_text = "I'd like to leave a message for Gary, please."
         await stt.results.put(request_text)
-        if direct_confirmation:
+        if direct_confirmation and not observed_truncated_request:
             target_question = "Of course. Who would you like me to leave the message for?"
             await _wait_until(lambda: target_question in tts.texts)
             await _wait_until(lambda: not engine.streaming_playback_manager.active_streams)
             await stt.results.put("Gary.")
-        content_question = (
-            "What would you like me to tell Gary?"
-            if direct_confirmation
-            else "Of course. What would you like me to tell Gary?"
-        )
+        if observed_truncated_request or not direct_confirmation:
+            content_question = "Of course. What would you like me to tell Gary?"
+        else:
+            content_question = "What would you like me to tell Gary?"
         await _wait_until(lambda: content_question in tts.texts)
-        if direct_confirmation:
+        if observed_truncated_request:
+            assert engine._pipeline_message_deposit_guard().snapshot(call_id) == {
+                "phase": "awaiting_message",
+                "has_target": True,
+                "has_message": False,
+            }
+            assert requests == []
+        if direct_confirmation and not observed_truncated_request:
             await _wait_until(lambda: not engine.streaming_playback_manager.active_streams)
             await stt.results.put("Okay, thanks.")
             await _wait_until(lambda: tts.texts.count("What would you like me to tell Gary?") >= 2)
             await _wait_until(lambda: not engine.streaming_playback_manager.active_streams)
             assert not request_seen.is_set()
             assert requests == []
+            assert (
+                engine._pipeline_message_deposit_guard().snapshot(call_id)["phase"]
+                == "awaiting_message"
+            )
             assert not any("Okay, thanks" in text for text in tts.texts)
         await _wait_until(lambda: not engine.streaming_playback_manager.active_streams)
         await stt.results.put("The sky is blue.")
         exact_readback = "I have: “The sky is blue.” Is that right?"
         await _wait_until(lambda: exact_readback in tts.texts)
         await _wait_until(lambda: not engine.streaming_playback_manager.active_streams)
+
+    if observed_truncated_request:
+        assert engine._pipeline_message_deposit_guard().snapshot(call_id) == {
+            "phase": "awaiting_confirmation",
+            "has_target": True,
+            "has_message": True,
+        }
+        assert requests == []
 
     start_index = len(outbound_frames)
     filler_count_before_confirmation = tts.texts.count(
@@ -754,6 +778,7 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
         "Thanks. I'll make sure they get it." if outcome == "barge-in-pending"
         else "I'll make sure Gary gets it." if outcome in {
             "success", "terminal-tts-correction", "terminal-tts-unchanged-retry",
+            "observed-truncated-request",
             "barge-in-terminal-absence", "prior-reference-serial", "prior-reference-streaming",
         }
         else failure_phrase
@@ -827,6 +852,7 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
     assert "Never speak this as success." not in tts.texts
     if outcome not in {
         "success", "barge-in-pending", "terminal-tts-correction", "terminal-tts-unchanged-retry",
+        "observed-truncated-request",
         "barge-in-terminal-absence", "prior-reference-serial", "prior-reference-streaming",
     }:
         assert "I'll make sure Gary gets it." not in tts.texts
@@ -868,6 +894,7 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
 
     if outcome in {
         "success", "barge-in-pending", "terminal-tts-correction", "terminal-tts-unchanged-retry",
+        "observed-truncated-request",
         "barge-in-terminal-absence", "prior-reference-serial", "prior-reference-streaming",
     }:
         await stt.results.put("Yes please.")
