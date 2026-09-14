@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "project": "Ava",
+  "release": "7.5.4-bajaj.20260914.1",
+  "sourceCommit": "fbb1e2d7a03234dc9fbfb85ba5f79a1bb5a0e9f5",
+  "sourceTree": "f0e944af4fc48cf366695071e71897401356dbc6",
+  "reconstructionBoundaryCommit": "7dcb5b1",
+  "upstreamLicense": "MIT",
+  "fleetAdditionsLicense": "AGPL-3.0-or-later",
+  "runtimeImage": "sha256:91ae246a07be78ff38ac4d5e95bcaa1deedac17bbaa1ae96c0e379455d04f2c7",
+  "runtimeTransition": {
+    "path": "src/engine.py",
+    "preimageSha256": "4d9da9e3b076aa399152f11a4c68c8e11922d87f6e892b27d0717b63f7351471",
+    "postimageSha256": "b0af355fab439b3d6eb08eabf33df5adc1a8d77d4dfd5b5921b0d9085cb7ac4a"
+  },
+  "claims": {
+    "sourceBuiltReleaseRequired": true,
+    "upstreamHistoryComplete": false,
+    "humanCallAcceptance": false,
+    "messageDepositDeliveryAcceptance": false
+  }
+}

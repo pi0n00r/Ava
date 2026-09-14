@@ -5,8 +5,26 @@ AI-NOTICE:Project=Ava
 AI-NOTICE:Scope=Fleet-authored changes; upstream MIT material retains its notices
 -->
 
-# Licence And Source Boundaries
+# Maintained Fork: Licence And Source Boundaries
 
-The supplied upstream LICENSE is retained byte-for-byte under MIT. Fleet-authored changes in src/engine.py, src/pipelines/openai.py and the two added focused tests are AGPL-3.0-or-later under the fleet notice directive. See LICENSE-AGPL-3.0.txt; these notices do not replace the upstream MIT licence. No runtime source file has been changed for packaging.
+This repository is the maintained Bajaj fleet fork of Ava. The supplied upstream
+`LICENSE` is retained byte-for-byte under MIT. Fleet-authored changes and added
+tests, deployment helpers, and documentation are AGPL-3.0-or-later under their
+AI-NOTICE headers and `LICENSE-AGPL-3.0.txt`. These notices supplement rather
+than replace the upstream MIT licence.
 
-Source is reconstructed from the exact supplied live root capture and frozen320-file candidate, not a claimed Git commit. Root README/CHANGELOG declare7.5.4; this distinct artifact is7.5.4-restored-full-bajaj.20260913, not interchangeable with historical Sep10/12 releases.
+The initial Git history was reconstructed from the exact supplied live-root
+capture because the corresponding upstream commit history was unavailable.
+Commit `7dcb5b1` records that boundary. Subsequent fleet commits are ordinary,
+reviewable source changes. Accepted work currently includes call capture and
+cancellation fixes, native greeting and wait-media behaviour, confirmed message
+deposit dispatch, prepared outbound speech, Unicode format-control handling,
+caller-end/gratitude behaviour, DTMF log redaction, and agent-configured HTTP
+tool advertisement. The root README/CHANGELOG version remains the upstream
+application version; `FLEET-RELEASE.json` identifies the distinct maintained
+fork release and never implies an upstream provenance that has not been proved.
+
+Production installation is built from a versioned fork source release. The
+`deploy/deploy-ava-http-advertisement.py` transaction exists for the currently
+reviewed one-file transition and recovery only; it is not a permanent patch
+replay mechanism or a substitute for the maintained source release.
