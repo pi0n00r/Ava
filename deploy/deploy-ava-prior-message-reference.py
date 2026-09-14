@@ -17,8 +17,8 @@ import tempfile
 import time
 import urllib.request
 
-COMMIT = "669b089ac64ba7f2201dd17506b703e58cefa3ff"
-SOURCE_TREE = "ff3283a44905a559922b1b4342e0319bb50b497e"
+COMMIT = "52768f25309b81bb1d5d67a25d8b936c54b749dd"
+SOURCE_TREE = "02be0f0af67ed85960aa8735a7c9a41c536a5c99"
 IMAGE = "sha256:91ae246a07be78ff38ac4d5e95bcaa1deedac17bbaa1ae96c0e379455d04f2c7"
 LIVE_ROOT = Path("/opt/AVA-AI-Voice-Agent-for-Asterisk/src")
 CANDIDATE_ROOT = Path(__file__).resolve().parent.parent / "src"
@@ -29,15 +29,6 @@ STAGE_OWNER = {"uid": 1001, "gid": 1001}
 SONYHAL_SOURCE_OWNER = {"uid": 1000, "gid": 1000}
 BEFORE = {
     "core/pipeline_message_deposit.py": {
-        "sha256": "fcbb49f2b771c9bcf939b7ab2ccad0c26c7d04462aabad1b2149fdab50041d47",
-        "size": 28322,
-        "mode": "0644",
-        "uid": 1001,
-        "gid": 1001
-    }
-}
-AFTER = {
-    "core/pipeline_message_deposit.py": {
         "sha256": "2cb7de41b528e72f3bf054001c790f4e775e941c38c54801c51940402a78732e",
         "size": 33214,
         "mode": "0644",
@@ -45,9 +36,18 @@ AFTER = {
         "gid": 1001
     }
 }
+AFTER = {
+    "core/pipeline_message_deposit.py": {
+        "sha256": "f1b2ce1fece75c6c0870c82c8266f8c82a7fc1df8aece96d350af1bc0f07e0be",
+        "size": 33599,
+        "mode": "0644",
+        "uid": 1001,
+        "gid": 1001
+    }
+}
 STAGED = {name:{**value,**STAGE_OWNER} for name,value in AFTER.items()}
 PROTECTED_PATHS = (".env", "config/ai-agent.yaml", "config/ai-agent.local.yaml", "docker-compose.yml")
-LOCK_NAME = ".runtime-prior-message-669b089.lock"
+LOCK_NAME = ".runtime-message-guard-52768f2.lock"
 
 class Blocked(Exception):
     pass
@@ -103,7 +103,7 @@ def protected_configuration(project, capture=False):
 
 def prepare_bytes(path,data,metadata):
     safe_path(path)
-    fd,temporary = tempfile.mkstemp(prefix=".ava-prior-message-669b089-",dir=path.parent)
+    fd,temporary = tempfile.mkstemp(prefix=".ava-message-guard-52768f2-",dir=path.parent)
     temporary = Path(temporary)
     try:
         with os.fdopen(fd,"wb") as stream:
@@ -479,7 +479,7 @@ def apply(native,root=LIVE_ROOT,candidate=CANDIDATE_ROOT,base=BACKUP_BASE,backup
     checked = check(native,root,candidate)
     safe_path(base); base.mkdir(parents=True,exist_ok=True)
     if backup is None:
-        backup = Path(tempfile.mkdtemp(prefix="runtime-prior-message-669b089-",dir=base))
+        backup = Path(tempfile.mkdtemp(prefix="runtime-message-guard-52768f2-",dir=base))
     else:
         backup = Path(backup)
         safe_path(backup)

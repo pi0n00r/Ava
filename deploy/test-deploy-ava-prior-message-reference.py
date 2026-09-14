@@ -51,6 +51,27 @@ class FakeNative:
         evidence={"sha256":deploy.sha256(self.database),"size":len(self.database)}
         return (copy.deepcopy(self.logical),self.database,evidence) if include_backup else copy.deepcopy(self.logical)
 
+class FrozenIdentityTests(unittest.TestCase):
+    def test_frozen_source_and_transition_identity(self):
+        self.assertEqual(
+            deploy.COMMIT,
+            "52768f25309b81bb1d5d67a25d8b936c54b749dd",
+        )
+        self.assertEqual(
+            deploy.SOURCE_TREE,
+            "02be0f0af67ed85960aa8735a7c9a41c536a5c99",
+        )
+        self.assertEqual(deploy.TARGETS, ("core/pipeline_message_deposit.py",))
+        self.assertEqual(
+            deploy.BEFORE[deploy.TARGETS[0]]["sha256"],
+            "2cb7de41b528e72f3bf054001c790f4e775e941c38c54801c51940402a78732e",
+        )
+        self.assertEqual(
+            deploy.AFTER[deploy.TARGETS[0]]["sha256"],
+            "f1b2ce1fece75c6c0870c82c8266f8c82a7fc1df8aece96d350af1bc0f07e0be",
+        )
+
+
 class TransactionTests(unittest.TestCase):
     def setUp(self):
         temporary=tempfile.TemporaryDirectory(prefix="ava-prior-message-fixture-")
