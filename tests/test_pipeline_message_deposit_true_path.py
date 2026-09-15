@@ -131,6 +131,40 @@ class _PriorReferenceLLM(LLMComponent):
         yield "I understand."
 
 
+class _MemoRequestLLM(LLMComponent):
+    """Select the existing capture tool once; all remaining steps bypass AI."""
+
+    def __init__(self, *, streaming=False):
+        self.supports_streaming = streaming
+        self.calls = 0
+        self.stream_calls = 0
+        self._pending_tool_calls_by_call = {}
+
+    async def generate(self, call_id, transcript, context, options):
+        self.calls += 1
+        assert not self.supports_streaming
+        assert self.calls == 1
+        assert transcript == "Take a memo."
+        return LLMResponse(text="", tool_calls=self._tool_calls())
+
+    @staticmethod
+    def _tool_calls():
+        return [{
+            "id": "semantic-memo-draft",
+            "name": "pbx_message_deposit",
+            "parameters": {"target": "Gary", "message": ""},
+        }]
+
+    async def generate_stream(self, call_id, transcript, context, options):
+        self.stream_calls += 1
+        assert self.supports_streaming
+        assert self.stream_calls == 1
+        assert transcript == "Take a memo."
+        self._pending_tool_calls_by_call[call_id] = self._tool_calls()
+        if False:
+            yield ""
+
+
 class _PendingBargeInLLM(LLMComponent):
     """Native cognition can select PBX, never replace the pending envelope."""
 
@@ -238,6 +272,8 @@ async def _wait_until(predicate, timeout=3.0):
         (False, True, "barge-in-terminal-absence"),
         (False, True, "prior-reference-serial"),
         (False, True, "prior-reference-streaming"),
+        (False, True, "semantic-memo"),
+        (False, True, "semantic-memo-streaming"),
     ],
     ids=[
         "legacy-primary", "legacy-followup", "main-direct-confirmation",
@@ -248,6 +284,8 @@ async def _wait_until(predicate, timeout=3.0):
         "main-terminal-tts-unchanged-retry",
         "main-barge-in-terminal-absence",
         "main-prior-reference-serial", "main-prior-reference-streaming",
+        "main-semantic-memo-one-inference",
+        "main-semantic-memo-streaming-one-inference",
     ],
 )
 @pytest.mark.asyncio
@@ -408,7 +446,10 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
     stt, tts = _ResultSTT(), _RecordingTTS()
     observed_truncated_request = outcome == "observed-truncated-request"
     prior_reference = outcome.startswith("prior-reference-")
-    if prior_reference:
+    semantic_memo = outcome.startswith("semantic-memo")
+    if semantic_memo:
+        llm = _MemoRequestLLM(streaming=outcome.endswith("-streaming"))
+    elif prior_reference:
         llm = _PriorReferenceLLM(streaming=outcome.endswith("-streaming"))
     elif outcome in {"barge-in-pending", "barge-in-terminal-absence"}:
         llm = _PendingBargeInLLM()
@@ -586,7 +627,19 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
     await writer.drain()
     await asyncio.wait_for(inbound_handler_seen.wait(), timeout=2)
 
-    if prior_reference:
+    if semantic_memo:
+        await stt.results.put("Take a memo.")
+        await _wait_until(lambda: "Of course. What would you like me to record for Gary?" in tts.texts)
+        await _wait_until(lambda: not engine.streaming_playback_manager.active_streams)
+        assert requests == []
+        assert llm.calls + llm.stream_calls == 1
+        await stt.results.put("The sky is blue.")
+        exact_readback = "For Gary. I have: “The sky is blue.” Is that right?"
+        await _wait_until(lambda: exact_readback in tts.texts)
+        await _wait_until(lambda: not engine.streaming_playback_manager.active_streams)
+        assert requests == []
+        assert llm.calls + llm.stream_calls == 1
+    elif prior_reference:
         await stt.results.put("The blue notebook is on the desk.")
         await _wait_until(lambda: "I understand." in tts.texts)
         await _wait_until(lambda: not engine.streaming_playback_manager.active_streams)
@@ -780,13 +833,14 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
             "success", "terminal-tts-correction", "terminal-tts-unchanged-retry",
             "observed-truncated-request",
             "barge-in-terminal-absence", "prior-reference-serial", "prior-reference-streaming",
+            "semantic-memo", "semantic-memo-streaming",
         }
         else failure_phrase
     )
     expected_suspensions = [True, False] * (
         4 if outcome == "barge-in-terminal-absence"
         else 3 if outcome in {"barge-in-pending", "terminal-tts-unchanged-retry"}
-        else 2 if outcome == "terminal-tts-correction" else 1)
+        else 2 if outcome == "terminal-tts-correction" or semantic_memo else 1)
     await _wait_until(lambda: terminal_phrase in tts.texts)
     await _wait_until(lambda: not engine.streaming_playback_manager.active_streams)
     await _wait_until(lambda: engine.no_input_watchdog.suspensions == expected_suspensions)
@@ -812,7 +866,7 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
         assert http_timeout_totals[0] == 180.0
         assert all(0 < total <= 180.0 for total in http_timeout_totals)
         assert engine._pipeline_message_deposit_guard()._confirmed_execution_window_sec == 5.0
-        assert llm.stream_calls == (1 if outcome == "prior-reference-streaming" else 0)
+        assert llm.stream_calls == (1 if outcome in {"prior-reference-streaming", "semantic-memo-streaming"} else 0)
         assert tts_before_first_dispatch.count(
             "Filler must not precede dispatch."
         ) == filler_count_before_confirmation
@@ -842,7 +896,7 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
         2 if outcome in {"barge-in-pending", "barge-in-terminal-absence"} else 0 if direct_confirmation
         else 2 if via_followup else 1
     )
-    expected_inferences = 1 if outcome == "prior-reference-serial" else expected_inferences
+    expected_inferences = 1 if outcome in {"prior-reference-serial", "semantic-memo"} else expected_inferences
     assert llm.calls == expected_inferences
     if outcome == "barge-in-pending":
         assert all(context.native_deposit_attempt == original_generation
@@ -854,6 +908,7 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
         "success", "barge-in-pending", "terminal-tts-correction", "terminal-tts-unchanged-retry",
         "observed-truncated-request",
         "barge-in-terminal-absence", "prior-reference-serial", "prior-reference-streaming",
+        "semantic-memo", "semantic-memo-streaming",
     }:
         assert "I'll make sure Gary gets it." not in tts.texts
         expected_phase = "reconciling" if outcome == "http-failure" else "acknowledged"
@@ -896,6 +951,7 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
         "success", "barge-in-pending", "terminal-tts-correction", "terminal-tts-unchanged-retry",
         "observed-truncated-request",
         "barge-in-terminal-absence", "prior-reference-serial", "prior-reference-streaming",
+        "semantic-memo", "semantic-memo-streaming",
     }:
         await stt.results.put("Yes please.")
     await asyncio.sleep(0.08)
@@ -955,6 +1011,19 @@ def test_direct_confirmation_reuses_existing_call_scoped_transport_only(options,
         assert engine._confirmed_pipeline_message_deposit_call(call_id, configured) is None
         with pytest.raises(ValueError, match="already_consumed"):
             engine._bind_pipeline_tool_parameters(call_id, selected["name"], {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("context,enabled", [("aimee", True), (None, True), ("aimee_main", False)])
+async def test_semantic_draft_cannot_activate_outside_trusted_main(context, enabled):
+    engine = Engine.__new__(Engine)
+    session = CallSession(call_id="role-boundary", caller_channel_id="role-boundary")
+    session.context_name = context
+    assert await engine._maybe_prepare_pipeline_message_deposit(
+        "role-boundary", session, None, [], {"target": "Gary", "message": ""},
+        enabled=enabled, tool_call_id="draft",
+    ) is False
+    assert not hasattr(engine, "_pipeline_message_deposit_guard_state")
 
 
 def test_direct_confirmation_does_not_extend_expired_guard_or_retain_after_cleanup():

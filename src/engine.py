@@ -7296,6 +7296,45 @@ class Engine:
         # before dispatch. Do not copy caller words into a second buffer.
         return {"name": "pbx_message_deposit", "parameters": {}}
 
+    async def _maybe_prepare_pipeline_message_deposit(
+        self,
+        call_id: str,
+        session: Any,
+        pipeline: Any,
+        conversation_history: List[Dict[str, Any]],
+        parameters: Dict[str, Any],
+        *,
+        enabled: bool,
+        tool_call_id: str,
+    ) -> bool:
+        """Turn a main-agent semantic draft into the existing caller readback."""
+        if not enabled or getattr(session, "context_name", None) != "aimee_main":
+            return False
+        decision = self._pipeline_message_deposit_guard().propose_caller_message(
+            call_id, parameters,
+        )
+        if decision is None:
+            return False
+        result = {
+            "status": "confirmation_required",
+            "artifact_verified": False,
+            "_direct_response_text": decision.text,
+        }
+        await record_in_call_tool_result(
+            session_store=self.session_store,
+            call_id=call_id,
+            tool_call_id=tool_call_id,
+            tool_name="pbx_message_deposit",
+            canonical_name="pbx_message_deposit",
+            parameters=parameters,
+            result=result,
+            duration_ms=0,
+        )
+        await self._maybe_speak_direct_pipeline_tool_result(
+            call_id, session, pipeline, conversation_history, result,
+        )
+        return True
+
     def _bind_pipeline_tool_parameters(
         self,
         call_id: str,
@@ -16687,6 +16726,13 @@ class Engine:
                                 if tool:
                                     canonical_tool = tool_registry.canonicalize_tool_name(name)
                                     if canonical_tool == "pbx_message_deposit":
+                                        if await self._maybe_prepare_pipeline_message_deposit(
+                                            call_id, session, pipeline, conversation_history, args,
+                                            enabled=message_caller_controls,
+                                            tool_call_id=function_call_id,
+                                        ):
+                                            tool_result_recorded = True
+                                            return
                                         tool_ctx.native_deposit_guard = self._pipeline_message_deposit_guard()
                                         tool_ctx.native_deposit_rearm = None
                                         tool_ctx.native_deposit_required = message_caller_controls
@@ -17002,6 +17048,12 @@ class Engine:
                                                         next_tool = tool_registry.get(next_name)
                                                         if next_tool:
                                                             if next_canonical_name == "pbx_message_deposit":
+                                                                if await self._maybe_prepare_pipeline_message_deposit(
+                                                                    call_id, session, pipeline, conversation_history, next_args,
+                                                                    enabled=message_caller_controls,
+                                                                    tool_call_id=next_function_call_id,
+                                                                ):
+                                                                    return
                                                                 tool_ctx.native_deposit_guard = self._pipeline_message_deposit_guard()
                                                                 tool_ctx.native_deposit_rearm = None
                                                                 tool_ctx.native_deposit_required = message_caller_controls

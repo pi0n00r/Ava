@@ -203,11 +203,12 @@ def _explicit_message_content(value: str, target: str) -> Optional[str]:
     return message
 
 
-def _quoted_readback(value: str) -> str:
+def _quoted_readback(value: str, target: str = "") -> str:
     # Keep the caller's normalized words verbatim.  Use ASCII quotes internally
     # so caller-supplied curly quotes cannot terminate the spoken outer quote.
     safe = value.replace("“", '"').replace("”", '"')
-    return f"I have: “{safe}” Is that right?"
+    recipient = f"For {target}. " if target else ""
+    return f"{recipient}I have: “{safe}” Is that right?"
 
 
 DecisionKind = Literal["pass", "speak", "suppress"]
@@ -250,6 +251,7 @@ class _DepositState:
     ]
     target: str
     message: str = ""
+    semantic_target: bool = False
     confirmed_until: float = 0.0
     acknowledged_until: float = 0.0
     dispatch_attempted: bool = False
@@ -550,7 +552,9 @@ class PipelineMessageDepositGuard:
                 )
             state.message = message
             state.phase = "awaiting_confirmation"
-            return DepositDecision(kind="speak", text=_quoted_readback(message))
+            return DepositDecision(kind="speak", text=_quoted_readback(
+                message, state.target if state.semantic_target else "",
+            ))
 
         if state.phase == "awaiting_confirmation":
             if key in _CANCEL:
@@ -573,7 +577,9 @@ class PipelineMessageDepositGuard:
             if correction:
                 state.message = correction
                 state.confirmed_until = 0.0
-                return DepositDecision(kind="speak", text=_quoted_readback(correction))
+                return DepositDecision(kind="speak", text=_quoted_readback(
+                    correction, state.target if state.semantic_target else "",
+                ))
             if referenced_target:
                 state.target = referenced_target
                 state.message = ""
@@ -612,6 +618,52 @@ class PipelineMessageDepositGuard:
             return DepositDecision()
 
         return DepositDecision()
+
+    def propose_caller_message(
+        self,
+        call_id: str,
+        model_parameters: Mapping[str, object],
+    ) -> Optional[DepositDecision]:
+        """Start readback from a semantic tool choice, never authorise a write.
+
+        Only the main-agent caller uses this entry. The draft must match a
+        fresh same-call utterance; keep those original words, not a model rewrite.
+        Existing or uncertain attempts continue through their original gates.
+        """
+        if self._states.get(call_id) is not None:
+            return None
+        if not isinstance(model_parameters, Mapping):
+            raise ValueError("message_deposit_invalid_parameters")
+        target = model_parameters.get("target")
+        message = model_parameters.get("message")
+        if not isinstance(target, str) or not isinstance(message, str):
+            raise ValueError("message_deposit_invalid_parameters")
+        target = _collapse_text(target)
+        message = _collapse_text(message)
+        if not target or len(target) > _MAX_TARGET_CHARS:
+            raise ValueError("message_deposit_invalid_parameters")
+        prior = self._prior_utterances.get(call_id)
+        if prior is None:
+            raise ValueError("message_deposit_no_caller_draft")
+        age = self._clock() - prior.observed_at
+        if age < 0 or age > self._prior_utterance_window_sec:
+            raise ValueError("message_deposit_caller_draft_expired")
+        if not message:
+            self._prior_utterances.pop(call_id, None)
+            self._states[call_id] = _DepositState(
+                phase="awaiting_message", target=target, semantic_target=True,
+            )
+            return DepositDecision(
+                kind="speak", text=f"Of course. What would you like me to record for {target}?",
+            )
+        if _intent_key(message) != _intent_key(prior.text):
+            raise ValueError("message_deposit_caller_draft_mismatch")
+        self._prior_utterances.pop(call_id, None)
+        self._states[call_id] = _DepositState(
+            phase="awaiting_confirmation", target=target, message=prior.text,
+            semantic_target=True,
+        )
+        return DepositDecision(kind="speak", text=_quoted_readback(prior.text, target))
 
     def consume_confirmed_tool_parameters(
         self,
