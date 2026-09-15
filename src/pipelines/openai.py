@@ -1032,6 +1032,9 @@ class OpenAILLMAdapter(LLMComponent):
                 self._pipeline_defaults.get("modalities", self._provider_defaults.default_modalities or ["text"]),
             ),
             "system_prompt": runtime_options.get("system_prompt", self._pipeline_defaults.get("system_prompt")),
+            "user_first_history": runtime_options.get(
+                "user_first_history", self._pipeline_defaults.get("user_first_history", False)
+            ) is True,
             "instructions": runtime_options.get("instructions", self._pipeline_defaults.get("instructions")),
             "temperature": runtime_options.get("temperature", self._pipeline_defaults.get("temperature", 0.7)),
             "max_tokens": runtime_options.get("max_tokens", self._pipeline_defaults.get("max_tokens")),
@@ -1121,18 +1124,26 @@ class OpenAILLMAdapter(LLMComponent):
     def _coalesce_messages(self, transcript: str, context: Dict[str, Any], merged: Dict[str, Any]) -> list[Dict[str, str]]:
         messages = context.get("messages")
         if messages:
-            return messages
+            conversation = messages
+        else:
+            conversation = []
+            system_prompt = merged.get("system_prompt") or context.get("system_prompt")
+            if system_prompt:
+                conversation.append({"role": "system", "content": system_prompt})
+            prior = context.get("prior_messages") or []
+            conversation.extend(prior)
+            if transcript:
+                conversation.append({"role": "user", "content": transcript})
 
-        conversation = []
-        system_prompt = merged.get("system_prompt") or context.get("system_prompt")
-        if system_prompt:
-            conversation.append({"role": "system", "content": system_prompt})
-
-        prior = context.get("prior_messages") or []
-        conversation.extend(prior)
-
-        if transcript:
-            conversation.append({"role": "user", "content": transcript})
+        if merged.get("user_first_history") is True:
+            # Strict templates require a user slot before our spoken greeting.
+            # Keep every spoken word and tool record; the empty slot is wire-only.
+            first = next((i for i, msg in enumerate(conversation)
+                          if msg.get("role") != "system"), None)
+            if first is not None and conversation[first].get("role") == "assistant":
+                conversation = (conversation[:first]
+                                + [{"role": "user", "content": ""}]
+                                + conversation[first:])
         return conversation
 
 
