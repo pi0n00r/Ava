@@ -2,7 +2,7 @@
 # AI-NOTICE:Schema-Version=0.1
 # AI-NOTICE:License=AGPL-3.0-or-later
 # AI-NOTICE:Project=Ava
-"""Fixture-only coverage for the one-guard transaction; no production access."""
+"""Fixture-only coverage for the paired transaction; no production access."""
 import copy
 import importlib.util
 import json
@@ -55,20 +55,20 @@ class FrozenIdentityTests(unittest.TestCase):
     def test_frozen_source_and_transition_identity(self):
         self.assertEqual(
             deploy.COMMIT,
-            "52768f25309b81bb1d5d67a25d8b936c54b749dd",
+            "27b936e93b61b35981a411eaede2fc4e42e461e7",
         )
         self.assertEqual(
             deploy.SOURCE_TREE,
-            "02be0f0af67ed85960aa8735a7c9a41c536a5c99",
+            "308dc8939d59887c3b75ab7b0233a32cd7ea0b4c",
         )
-        self.assertEqual(deploy.TARGETS, ("core/pipeline_message_deposit.py",))
+        self.assertEqual(deploy.TARGETS, ("core/pipeline_message_deposit.py", "engine.py"))
         self.assertEqual(
             deploy.BEFORE[deploy.TARGETS[0]]["sha256"],
-            "2cb7de41b528e72f3bf054001c790f4e775e941c38c54801c51940402a78732e",
+            "f1b2ce1fece75c6c0870c82c8266f8c82a7fc1df8aece96d350af1bc0f07e0be",
         )
         self.assertEqual(
             deploy.AFTER[deploy.TARGETS[0]]["sha256"],
-            "f1b2ce1fece75c6c0870c82c8266f8c82a7fc1df8aece96d350af1bc0f07e0be",
+            "d9cf660a226d4e2c2a2e1ee2a8b4ee9a2cd89d7f84a2571a978bd3a6aa445693",
         )
 
 
@@ -481,8 +481,10 @@ class TransactionTests(unittest.TestCase):
                 changed[0]=True;path.write_bytes(b"WRONG_RESTORED_BYTES=True\n")
             return result
         with mock.patch.object(deploy,"replace_prepared",side_effect=corrupt_after_restore):
-            with self.assertRaisesRegex(deploy.Blocked,"postflight_runtime_files_mismatch|container_runtime_source_mismatch"):self.rollback(backup)
+            # The paired transaction detects the first corrupt restore before replacing the second file.
+            with self.assertRaisesRegex(deploy.Blocked,"runtime_file_conflict"):self.rollback(backup)
         self.assertTrue(changed[0])
+        self.assertFalse(self.native.running)
     def test_each_physical_config_drift_blocks_rollback_without_rewind(self):
         backup,_=self.apply()
         for name in deploy.PROTECTED_PATHS:
@@ -628,11 +630,11 @@ class NativeContractTests(unittest.TestCase):
             logical,body,evidence=deploy.Native().agent_snapshot(True)
         self.assertEqual(body,database);self.assertNotIn("backup_b64",logical)
         self.assertEqual(evidence["sha256"],deploy.sha256(database))
-    def test_native_runtime_binding_checks_only_guard(self):
+    def test_native_runtime_binding_checks_only_guard_and_engine(self):
         with mock.patch.object(deploy.Native,"run",return_value=json.dumps(deploy.BEFORE).encode()) as run:
             deploy.Native().runtime_files(deploy.BEFORE)
         body=run.call_args.kwargs["body"].decode()
-        self.assertEqual(deploy.TARGETS,("core/pipeline_message_deposit.py",))
+        self.assertEqual(deploy.TARGETS,("core/pipeline_message_deposit.py", "engine.py"))
         for name in deploy.TARGETS:self.assertIn(name,body)
         self.assertIn("/app/src",body)
         self.assertNotIn("print(b)",body)

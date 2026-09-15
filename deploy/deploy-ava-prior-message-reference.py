@@ -2,7 +2,7 @@
 # AI-NOTICE:Schema-Version=0.1
 # AI-NOTICE:License=AGPL-3.0-or-later
 # AI-NOTICE:Project=Ava
-"""Frozen one-guard Ava activation; database/config captures are evidence only."""
+"""Paired main memo activation; database/config captures are evidence only."""
 import argparse
 import base64
 import fcntl
@@ -17,32 +17,40 @@ import tempfile
 import time
 import urllib.request
 
-COMMIT = "52768f25309b81bb1d5d67a25d8b936c54b749dd"
-SOURCE_TREE = "02be0f0af67ed85960aa8735a7c9a41c536a5c99"
+COMMIT = "27b936e93b61b35981a411eaede2fc4e42e461e7"
+SOURCE_TREE = "308dc8939d59887c3b75ab7b0233a32cd7ea0b4c"
 IMAGE = "sha256:91ae246a07be78ff38ac4d5e95bcaa1deedac17bbaa1ae96c0e379455d04f2c7"
 LIVE_ROOT = Path("/opt/AVA-AI-Voice-Agent-for-Asterisk/src")
 CANDIDATE_ROOT = Path(__file__).resolve().parent.parent / "src"
 BACKUP_BASE = Path("/home/aimee/.local/share/ava-rollback")
-TARGETS = ("core/pipeline_message_deposit.py",)
+TARGETS = ("core/pipeline_message_deposit.py", "engine.py")
 RUNTIME_OWNER = {"uid": 1001, "gid": 1001}
 STAGE_OWNER = {"uid": 1001, "gid": 1001}
 SONYHAL_SOURCE_OWNER = {"uid": 1000, "gid": 1000}
 BEFORE = {
-    "core/pipeline_message_deposit.py": {
-        "sha256": "2cb7de41b528e72f3bf054001c790f4e775e941c38c54801c51940402a78732e",
-        "size": 33214,
-        "mode": "0644",
-        "uid": 1001,
-        "gid": 1001
-    }
-}
-AFTER = {
     "core/pipeline_message_deposit.py": {
         "sha256": "f1b2ce1fece75c6c0870c82c8266f8c82a7fc1df8aece96d350af1bc0f07e0be",
         "size": 33599,
         "mode": "0644",
         "uid": 1001,
         "gid": 1001
+    },
+    "engine.py": {
+        "sha256": "1e382013e719b1eb73aa163f2e462d3ea71a32bf1c374335009506e178ad1780",
+        "size": 1122150, "mode": "0644", "uid": 1001, "gid": 1001
+    }
+}
+AFTER = {
+    "core/pipeline_message_deposit.py": {
+        "sha256": "d9cf660a226d4e2c2a2e1ee2a8b4ee9a2cd89d7f84a2571a978bd3a6aa445693",
+        "size": 36126,
+        "mode": "0644",
+        "uid": 1001,
+        "gid": 1001
+    },
+    "engine.py": {
+        "sha256": "5ed471f1a0395595c22f112b8d43b574aeb698105fa03ea2abd63cdd9a8d1c4e",
+        "size": 1124606, "mode": "0644", "uid": 1001, "gid": 1001
     }
 }
 STAGED = {name:{**value,**STAGE_OWNER} for name,value in AFTER.items()}
